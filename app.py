@@ -4,8 +4,8 @@ from bs4 import BeautifulSoup
 from pathlib import Path
 import re
 import tempfile
-import zipfile  # 👈 新增：用來打包 ZIP
-import io       # 👈 新增：用來在記憶體中處理檔案
+import zipfile
+import io
 
 # 載入原本寫好的工具包
 import fetch_images as fi
@@ -14,12 +14,17 @@ import fetch_images as fi
 st.set_page_config(page_title="雙平台圖片抓取神器", page_icon="📦", layout="wide")
 st.title("📦 寵物商品圖片抓取與去背工具")
 
+# --- 🧠 狀態暫存區 (解決下載中斷的關鍵魔法) ---
+if "task_completed" not in st.session_state:
+    st.session_state.task_completed = False
+    st.session_state.successful_files = []
+    st.session_state.result_rows = []
+
 # --- 2. 左側邊欄設定區 ---
 st.sidebar.header("⚙️ 進階設定")
 size = st.sidebar.number_input("輸出圖片大小 (px)", min_value=100, max_value=2000, value=800)
 padding = st.sidebar.number_input("邊界留白 (px)", min_value=0, max_value=200, value=24)
 
-# 建立參數物件
 class UIArgs:
     def __init__(self):
         self.output_dir = Path("output")
@@ -76,6 +81,10 @@ input_text = st.text_area(
 
 # --- 4. 執行邏輯 ---
 if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
+    # 每次按鈕按下，先清除舊的記憶
+    st.session_state.task_completed = False
+    st.session_state.successful_files = []
+    
     if not input_text.strip():
         st.warning("請先輸入商品 ID 喔！")
     else:
@@ -84,10 +93,8 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
         
         if not product_ids:
             st.error("找不到有效的商品 ID...")
-        # 👇 新增的安全保護機制：限制最多 20 筆
         elif len(product_ids) > 20:
             st.error(f"⚠️ 為了避免雲端主機當機或被網站封鎖，每次最多只能處理 20 筆 ID 喔！（您目前輸入了 {len(product_ids)} 筆，請分批執行）")
-        # 👆 新增結束
         else:
             st.success(f"✅ 成功載入 {len(product_ids)} 筆【{platform}】的任務！準備開工...")
             progress_bar = st.progress(0)
@@ -119,28 +126,34 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
                     st.error(f"❌ ID {pid} 處理失敗: {exc}")
                     
                 rows.append(row)
-                fi.write_report(rows, args.report)
                 progress_bar.progress(index / len(product_ids))
                 
             status_text.text("🎉 所有任務處理完成！")
             st.balloons()
             
-            # --- 🎁 打包 ZIP 下載功能 ---
-            successful_files = [row["final_path"] for row in rows if row.get("status") == "success" and row.get("final_path")]
-            
-            if successful_files:
-                st.markdown("---")
-                st.markdown("### 🎁 打包下載區")
-                
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                    for file_path in successful_files:
-                        zip_file.write(file_path, Path(file_path).name)
-                
-                st.download_button(
-                    label="📦 一鍵下載所有去背圖片 (ZIP 壓縮檔)",
-                    data=zip_buffer.getvalue(),
-                    file_name="pet_images_output.zip",
-                    mime="application/zip",
-                    use_container_width=True
-                )
+            # --- 關鍵：把成功抓到的圖片清單「記在腦海裡 (Session State)」---
+            st.session_state.successful_files = [r["final_path"] for r in rows if r.get("status") == "success" and r.get("final_path")]
+            st.session_state.result_rows = rows
+            st.session_state.task_completed = True
+
+# --- 5. 獨立的下載區塊 (完全不受重整影響) ---
+if st.session_state.task_completed and st.session_state.successful_files:
+    st.markdown("---")
+    st.markdown("### 🎁 打包下載區")
+    
+    # 顯示報表
+    st.dataframe(st.session_state.result_rows, use_container_width=True)
+    
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in st.session_state.successful_files:
+            zip_file.write(file_path, Path(file_path).name)
+    
+    # 我也順便幫你優化了按鈕文字，讓你可以看到總共包了幾張圖進去！
+    st.download_button(
+        label=f"📦 一鍵下載 {len(st.session_state.successful_files)} 張去背圖片 (ZIP 壓縮檔)",
+        data=zip_buffer.getvalue(),
+        file_name="pet_images_output.zip",
+        mime="application/zip",
+        use_container_width=True
+    )

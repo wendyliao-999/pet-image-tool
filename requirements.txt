@@ -1,0 +1,8 @@
+streamlit
+requests
+beautifulsoup4
+rembg
+onnxruntime
+Pillow
+numpy
+scipy

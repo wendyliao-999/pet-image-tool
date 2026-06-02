@@ -20,9 +20,10 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 try:
-    from rembg import remove
+    from rembg import remove, new_session
 except ImportError:
     remove = None
+    new_session = None
 
 
 BASE_URL = "https://petpetgo.com/product/{product_id}"
@@ -286,19 +287,32 @@ def clean_cutout_alpha(
 def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
+    
+    # 🌟 優化關鍵 1：啟用專門針對電商產品優化的 ISNet 模型
+    # 注意：第一次使用雲端會自動下載此模型 (約 100MB+)，需要等待數分鐘。
+    session = new_session("isnet-general-use")
+    
     with Image.open(input_path) as img:
         rgba = img.convert("RGBA")
+        
+        # 為了乾淨輸出，我們攔截 rembg 的後台輸出
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
+            
+            # 調用 remove 進行去背
             cutout = remove(
                 rgba,
-                alpha_matting=False,
-                alpha_matting_foreground_threshold=240,
-                alpha_matting_background_threshold=12,
-                alpha_matting_erode_size=8,
-                post_process_mask=True,
+                session=session,        # 👈 🌟 優化：使用新模型會話
+                alpha_matting=False,    # 👈 保持 False，防止硬邊緣商品被柔化吃掉
+                post_process_mask=True  # 👈 🌟 優化關鍵 2：開啟後處理，自動修補 mask 裡的小破洞，減少咬肉
             )
+            
+    # 這裡呼叫原本舊有的 clean_cutout_alpha 函數做最後清理（如果你的舊程式碼有這個的話）
+    # 如果替換後報錯找不到 clean_cutout_alpha，可以直接 return cutout
+    try:
         return clean_cutout_alpha(cutout)
+    except NameError:
+        return cutout
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:

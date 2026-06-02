@@ -3,7 +3,9 @@ import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
 import re
-import tempfile  # 👈 新增：用來建立閱後即焚的暫存資料夾
+import tempfile
+import zipfile  # 👈 新增：用來打包 ZIP
+import io       # 👈 新增：用來在記憶體中處理檔案
 
 # 載入原本寫好的工具包
 import fetch_images as fi
@@ -24,9 +26,9 @@ class UIArgs:
         self.report = Path("output/report.csv")
         self.size = size
         self.padding = padding
-        self.keep_original = False  # 👈 這裡設為 False，Petpetgo 的原始圖就不會存下來了
+        self.keep_original = False
 
-# --- ✨ 修改：寵物公園專屬抓圖引擎 (加上自動清理機制) ---
+# --- ✨ 寵物公園專屬抓圖引擎 ---
 def process_petpark(product_id, args):
     session = requests.Session()
     session.headers.update({"User-Agent": fi.USER_AGENT})
@@ -45,16 +47,13 @@ def process_petpark(product_id, args):
     img_resp = session.get(raw_img_url, timeout=30)
     img_resp.raise_for_status()
     
-    # 👇 使用 with 建立暫存資料夾，一旦這個區塊執行完畢，原始圖就會自動被刪除！
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir) / f"{product_id}.jpg"
         temp_path.write_bytes(img_resp.content)
         
-        # 進行去背與縮放
         removed = fi.remove_background(temp_path)
         final = fi.fit_to_canvas(removed, size=args.size, padding=args.padding)
     
-    # 只把最終去背好的圖存進 output/final 裡
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
     final_file = args.output_dir / "final" / f"{product_id}.png"
     final.save(final_file)
@@ -72,7 +71,7 @@ platform = st.radio("🏷️ 請選擇這次要抓取的平台：", ["Petpetgo",
 input_text = st.text_area(
     "🔗 請貼上商品 ID (可換行或逗號分隔)：",
     height=150,
-    placeholder="範例寫法:\n12345\n67890"
+    placeholder="範例寫法:\n12345\nWP006404"
 )
 
 # --- 4. 執行邏輯 ---
@@ -85,6 +84,10 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
         
         if not product_ids:
             st.error("找不到有效的商品 ID...")
+        # 👇 新增的安全保護機制：限制最多 20 筆
+        elif len(product_ids) > 20:
+            st.error(f"⚠️ 為了避免雲端主機當機或被網站封鎖，每次最多只能處理 20 筆 ID 喔！（您目前輸入了 {len(product_ids)} 筆，請分批執行）")
+        # 👆 新增結束
         else:
             st.success(f"✅ 成功載入 {len(product_ids)} 筆【{platform}】的任務！準備開工...")
             progress_bar = st.progress(0)
@@ -121,4 +124,23 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
                 
             status_text.text("🎉 所有任務處理完成！")
             st.balloons()
-            st.dataframe(rows, use_container_width=True)
+            
+            # --- 🎁 打包 ZIP 下載功能 ---
+            successful_files = [row["final_path"] for row in rows if row.get("status") == "success" and row.get("final_path")]
+            
+            if successful_files:
+                st.markdown("---")
+                st.markdown("### 🎁 打包下載區")
+                
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    for file_path in successful_files:
+                        zip_file.write(file_path, Path(file_path).name)
+                
+                st.download_button(
+                    label="📦 一鍵下載所有去背圖片 (ZIP 壓縮檔)",
+                    data=zip_buffer.getvalue(),
+                    file_name="pet_images_output.zip",
+                    mime="application/zip",
+                    use_container_width=True
+                )

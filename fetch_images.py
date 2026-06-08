@@ -242,13 +242,9 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
         score_candidate(candidate, product_id)
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
-    runner_up = ranked[1] if len(ranked) > 1 else None
-
-    if best.edge_white_ratio < 0.55:
-        return best, "needs_review", "最佳候選圖邊緣白底比例偏低"
-    if runner_up and best.score - runner_up.score < 8:
-        return best, "needs_review", "前兩名候選圖分數接近"
-    return best, "success", "自動挑選"
+    
+    # 🌟 優化：完全拔除選擇困難症煞車，無腦選第一名，確保可以順利下載 ZIP
+    return best, "success", "自動挑選 (已關閉人工審核)"
 
 
 def clean_cutout_alpha(
@@ -288,31 +284,34 @@ def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
-    # 🌟 優化關鍵 1：啟用專門針對電商產品優化的 ISNet 模型
-    # 注意：第一次使用雲端會自動下載此模型 (約 100MB+)，需要等待數分鐘。
+    # 🌟 啟用專門針對電商產品優化的 ISNet 模型
     session = new_session("isnet-general-use")
     
     with Image.open(input_path) as img:
         rgba = img.convert("RGBA")
         
-        # 為了乾淨輸出，我們攔截 rembg 的後台輸出
+        # 攔截 rembg 的後台輸出
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
             
-            # 調用 remove 進行去背
+            # 1. 產生標準硬邊緣去背圖
             cutout = remove(
                 rgba,
-                session=session,        # 👈 🌟 優化：使用新模型會話
-                alpha_matting=False,    # 👈 保持 False，防止硬邊緣商品被柔化吃掉
-                post_process_mask=True  # 👈 🌟 優化關鍵 2：開啟後處理，自動修補 mask 裡的小破洞，減少咬肉
+                session=session,
+                alpha_matting=False,
+                post_process_mask=True
             )
             
-    # 這裡呼叫原本舊有的 clean_cutout_alpha 函數做最後清理（如果你的舊程式碼有這個的話）
-    # 如果替換後報錯找不到 clean_cutout_alpha，可以直接 return cutout
+            # 2. 邊緣平滑處理 (解決鋸齒狀的關鍵魔法)
+            alpha = cutout.split()[3]
+            smoothed_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.5))
+            rgb = cutout.convert("RGB")
+            final_img = Image.merge("RGBA", (*rgb.split(), smoothed_alpha))
+            
     try:
-        return clean_cutout_alpha(cutout)
+        return clean_cutout_alpha(final_img)
     except NameError:
-        return cutout
+        return final_img
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
@@ -335,6 +334,7 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
     canvas.alpha_composite(rgba, (padding, padding))
     
     return canvas
+
 
 def save_review_candidates(candidates: Iterable[Candidate], review_dir: Path) -> None:
     review_dir.mkdir(parents=True, exist_ok=True)

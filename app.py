@@ -132,7 +132,7 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
             st.balloons()
             
             # --- 關鍵：把成功抓到的圖片清單「記在腦海裡 (Session State)」---
-            st.session_state.successful_files = [r["final_path"] for r in rows if r.get("status") == "success" and r.get("final_path")]
+            st.session_state.successful_files = [r["final_path"] for r in rows if r.get("final_path") and Path(r["final_path"]).exists()]
             st.session_state.result_rows = rows
             st.session_state.task_completed = True
 

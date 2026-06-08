@@ -304,7 +304,7 @@ def remove_background(input_path: Path) -> Image.Image:
             
             # 2. 邊緣平滑處理 (解決鋸齒狀的關鍵魔法)
             alpha = cutout.split()[3]
-            smoothed_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1))
+            smoothed_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.3))
             rgb = cutout.convert("RGB")
             final_img = Image.merge("RGBA", (*rgb.split(), smoothed_alpha))
             

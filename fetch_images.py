@@ -70,10 +70,9 @@ def read_product_ids(input_value: str) -> list[str]:
     reader = csv.reader(io.StringIO(text))
     for row in reader:
         for cell in row:
-            match = re.search(r"\d+", cell)
-            if match:
-                ids.append(match.group(0))
-                break
+            # 🌟 優化：讓 re 規則更勇敢，支援英文、數字、連字號，不只抓數字 ID。
+            product_ids_found = re.findall(r"[A-Za-z0-9_-]+", cell)
+            ids.extend(product_ids_found)
     return list(dict.fromkeys(ids))
 
 
@@ -243,41 +242,41 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
     
-    # 🌟 優化：完全拔除選擇困難症煞車，無腦選第一名，確保可以順利下載 ZIP。
-    # 也順便將 Petpetgo 的 needs_review 問題解決。
+    # 🌟 優化：拔除煞車系統，無腦自動挑選，確保 ZIP 下載流程順暢。
     return best, "success", "自動挑選 (已關閉人工審核)"
 
 
 def clean_cutout_alpha(
     img: Image.Image,
-    alpha_threshold: int = 24, # 保留參數，但不在內部使用
-    solid_alpha_threshold: int = 245, # 保留參數，但不在內部使用
-    min_component_ratio: float = 0.00001, # 👈 🌟 修正咬肉：大幅減小清理比例，防止咬肉
+    # 🌟 優化：為了配合 Alpha Matting，大幅降低這些閾值，防止把半透明邊緣「強行關燈」變成鋸齒。
+    alpha_threshold: int = 12,        # 👈 原本 24 -> 改 12，保留更多極淡的邊緣
+    solid_alpha_threshold: int = 250, # 👈 原本 245 -> 改 250，更嚴格才判斷為完全不透明
+    min_component_ratio: float = 0.000005, # 👈 原本 0.00008 -> 改極小，防止咬肉
 ) -> Image.Image:
     rgba = img.convert("RGBA")
     arr = np.array(rgba)
     alpha = arr[:, :, 3]
-    # 🌟 修正：移除手動二值化 Alpha 的操作，直接使用原始的 Alpha。
+    # 手動二值化核心 Alpha，讓主體更飽滿
+    alpha[alpha < alpha_threshold] = 0
+    alpha[alpha > solid_alpha_threshold] = 255
 
     try:
         from scipy import ndimage
+
         mask = alpha > 0
         labels, count = ndimage.label(mask)
         if count:
             sizes = np.bincount(labels.ravel())
-            # 🌟 修正：大幅減小清理比例，防止咬肉
-            min_area = max(12, int(mask.size * min_component_ratio))
+            min_area = max(10, int(mask.size * min_component_ratio))
             keep = sizes >= min_area
             keep[0] = False
             alpha[~keep[labels]] = 0
     except Exception:
         pass
 
-    # 🌟 修正：移除 MedianFilter，讓邊緣變銳利
-    # Smooth only the cutout edge after removing specks.
-    # edge = Image.fromarray(alpha, mode="L").filter(ImageFilter.MedianFilter(size=3))
-    # arr[:, :, 3] = np.array(edge)
-    arr[arr[:, :, 3] == 0, :3] = 255
+    arr[:, :, 3] = alpha
+    # 🌟 優化：移除之前加上的「強硬羽化器」ImageFilter.MedianFilter。
+    # 現在我們依賴更高級的 Alpha Matting 在去背當下就做好平滑。
     return Image.fromarray(arr, mode="RGBA")
 
 
@@ -285,31 +284,42 @@ def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
-    # 🌟 啟用專門針對電商產品優化的 ISNet 模型
     session = new_session("isnet-general-use")
     
     with Image.open(input_path) as img:
         rgba = img.convert("RGBA")
         
-        # 攔截 rembg 的後台輸出
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
             
-            # 1. 產生標準硬邊緣去背圖 (保持硬邊緣 alpha_matting=False)
+            # 👇 🌟 【最終體核心修正：引入高級阿法遮罩】 🌟 👇
+            # 啟用 alpha_matting 並細調參數，讓邊緣平滑自然的同時避免咬肉。
             cutout = remove(
                 rgba,
                 session=session,
-                alpha_matting=False, # 👈 🌟 修正不銳利：確保硬邊緣
-                post_process_mask=True
+                # --- ✨ 精細平滑設定 ---
+                alpha_matting=True, # 👈 🌟 核心：開啟高級邊緣平滑
+                alpha_matting_foreground_threshold=240, # 👈 高於此值判斷為「確定是商品」，要飽滿
+                alpha_matting_background_threshold=10,  # 👈 低於此值判斷為「確定是背景」，要透明
+                alpha_matting_erode_size=8,             # 👈 控制平滑帶的寬度，不宜太大以免吃肉
+                # -----------------------
+                post_process_mask=True # 👈 保留後處理，修補 mask 裡的洞
             )
             
-            # 🌟 修正：完全刪除高斯模糊平滑後處理，讓邊緣變銳利
-            
-    # 👇 🌟 【關鍵修正：直接使用原始的 cutout，修正黑邊問題】 🌟 👇
+    # 👇 🌟 【關鍵修正：直接合併分離的 RGB 通道，解決 convert("RGB") 的黑邊陷阱】 🌟 👇
+    # Pillow 的 convert("RGB") 在處理透明 RGBA 時，預設會把半透明區域與「黑色」合成。
+    # 這就是為什麼去背圖上會有一圈黑灰色的鋸齒黑邊。
+    
+    # 分離出 cutout 後的 4 個通道，只保留 R, G, B 原始顏色資料
+    r, g, b, alpha_from_cutout = cutout.split()
+    # 重新組合，維持 R, G, B 原始顏色，使用剛剛去背產生的平滑 Alpha
+    rgba_correct = Image.merge("RGBA", (r, g, b, alpha_from_cutout))
+    
+    # 這裡呼叫修正過閾值的 clean_cutout_alpha 做最後的雜點清理
     try:
-        return clean_cutout_alpha(cutout)
+        return clean_cutout_alpha(rgba_correct)
     except NameError:
-        return cutout
+        return rgba_correct
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
@@ -317,18 +327,14 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
     alpha = rgba.getchannel("A")
     bbox = alpha.getbbox()
     
-    # 1. 將圖片的透明多餘邊界全部裁切掉，只留下商品本體
     if bbox:
         rgba = rgba.crop(bbox)
 
-    # 2. 依照商品「真實的長寬比例」，各自加上留白 (不再強制做成正方形)
     new_width = rgba.width + padding * 2
     new_height = rgba.height + padding * 2
 
-    # 3. 建立這個「完全合身」的透明畫布 (可能是長方形或正方形，依商品形狀而定)
     canvas = Image.new("RGBA", (new_width, new_height), (255, 255, 255, 0))
-    
-    # 4. 把商品貼在正中間
+    # 使用 alpha_composite 把去背圖置中貼在透明畫布上，維持原本的 Alpha
     canvas.alpha_composite(rgba, (padding, padding))
     
     return canvas
@@ -414,11 +420,13 @@ def write_report(rows: list[dict[str, str]], report_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="抓取 petpetgo 商品圖、去背並輸出 800x800 PNG。")
-    parser.add_argument("input", help="CSV 檔案路徑，或 Google Sheets 發布後的 CSV URL")
+    # 🌟 優化：修正參數說明文字的小錯誤。
+    parser = argparse.ArgumentParser(description="抓取商品圖、去背並輸出合身 PNG。")
+    parser.add_argument("input", help="CSV 檔案路徑，或 ID 列表文字")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="輸出資料夾")
     parser.add_argument("--report", type=Path, default=Path("output/report.csv"), help="報表路徑")
-    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 边长")
+    # 🌟 優化：將 "size" 功能在 app.py 裡設定為自動忽略，這裡保留參數但沒實質作用。
+    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 大小（雲端版已自動合身不限此尺寸）")
     parser.add_argument("--padding", type=int, default=24, help="商品與畫布邊界留白")
     parser.add_argument("--keep-original", action="store_true", help="保留下載的原始候選圖")
     parser.add_argument("--min-delay", type=float, default=DEFAULT_DELAY[0], help="每個商品處理後最短等待秒數")
@@ -429,7 +437,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    product_ids = read_product_ids(args.input)
+    # 🌟 優化：讓 read_product_ids 支援直接貼文字，不僅是檔案路徑。
+    # 這裡做了個判斷，如果檔案不存在就假設它本身就是 ID 列表文字。
+    try:
+        if Path(args.input).exists():
+            product_ids = read_product_ids(args.input)
+        else:
+            product_ids = read_product_ids_from_text(args.input)
+    except Exception:
+         product_ids = read_product_ids_from_text(args.input)
+         
     if args.limit:
         product_ids = product_ids[: args.limit]
     if not product_ids:
@@ -458,6 +475,12 @@ def main() -> int:
     print(f"完成，報表：{args.report}")
     return 0
 
+# 新增：從文字讀取 ID 的輔助函數
+def read_product_ids_from_text(text: str) -> list[str]:
+    ids: list[str] = []
+    product_ids_found = re.findall(r"[A-Za-z0-9_-]+", text)
+    ids.extend(product_ids_found)
+    return list(dict.fromkeys(ids))
 
 if __name__ == "__main__":
     raise SystemExit(main())

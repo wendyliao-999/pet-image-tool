@@ -243,7 +243,6 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
     
-    # 🌟 優化：完全拔除選擇困難症煞車，無腦選第一名，確保可以順利下載 ZIP
     return best, "success", "自動挑選 (已關閉人工審核)"
 
 
@@ -273,7 +272,6 @@ def clean_cutout_alpha(
     except Exception:
         pass
 
-    # Smooth only the cutout edge after removing specks.
     edge = Image.fromarray(alpha, mode="L").filter(ImageFilter.MedianFilter(size=3))
     arr[:, :, 3] = np.array(edge)
     arr[arr[:, :, 3] == 0, :3] = 255
@@ -284,17 +282,15 @@ def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
-    # 🌟 啟用專門針對電商產品優化的 ISNet 模型
     session = new_session("isnet-general-use")
     
     with Image.open(input_path) as img:
         rgba = img.convert("RGBA")
         
-        # 攔截 rembg 的後台輸出
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
             
-            # 1. 產生標準硬邊緣去背圖
+            # 1. 產生標準硬邊緣去背圖 (這步 rembg 會處理好顏色)
             cutout = remove(
                 rgba,
                 session=session,
@@ -302,11 +298,16 @@ def remove_background(input_path: Path) -> Image.Image:
                 post_process_mask=True
             )
             
-            # 2. 邊緣平滑處理 (解決鋸齒狀的關鍵魔法)
+            # 2. 邊緣平滑處理
             alpha = cutout.split()[3]
-            smoothed_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.3))
-            rgb = cutout.convert("RGB")
-            final_img = Image.merge("RGBA", (*rgb.split(), smoothed_alpha))
+            smoothed_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.5))
+            
+            # 👇 🌟 【關鍵修正：解決黑邊問題】 🌟 👇
+            # 分離 RGBA 圖層，丟棄舊的 Alpha
+            r, g, b, _ = cutout.split()
+            # 使用原始 R、G、B 通道與新的平滑 Alpha 合併
+            # 避免使用 convert("RGB")，因為它預設會與黑色合成
+            final_img = Image.merge("RGBA", (r, g, b, smoothed_alpha))
             
     try:
         return clean_cutout_alpha(final_img)
@@ -319,18 +320,13 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
     alpha = rgba.getchannel("A")
     bbox = alpha.getbbox()
     
-    # 1. 將圖片的透明多餘邊界全部裁切掉，只留下商品本體
     if bbox:
         rgba = rgba.crop(bbox)
 
-    # 2. 依照商品「真實的長寬比例」，各自加上留白 (不再強制做成正方形)
     new_width = rgba.width + padding * 2
     new_height = rgba.height + padding * 2
 
-    # 3. 建立這個「完全合身」的透明畫布 (可能是長方形或正方形，依商品形狀而定)
     canvas = Image.new("RGBA", (new_width, new_height), (255, 255, 255, 0))
-    
-    # 4. 把商品貼在正中間
     canvas.alpha_composite(rgba, (padding, padding))
     
     return canvas

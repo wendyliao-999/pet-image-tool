@@ -243,28 +243,29 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
     
+    # 🌟 優化：完全拔除選擇困難症煞車，無腦選第一名，確保可以順利下載 ZIP。
+    # 也順便將 Petpetgo 的 needs_review 問題解決。
     return best, "success", "自動挑選 (已關閉人工審核)"
 
 
 def clean_cutout_alpha(
     img: Image.Image,
-    alpha_threshold: int = 24,
-    solid_alpha_threshold: int = 245,
-    min_component_ratio: float = 0.00008,
+    alpha_threshold: int = 24, # 保留參數，但不在內部使用
+    solid_alpha_threshold: int = 245, # 保留參數，但不在內部使用
+    min_component_ratio: float = 0.00001, # 👈 🌟 修正咬肉：大幅減小清理比例，防止咬肉
 ) -> Image.Image:
     rgba = img.convert("RGBA")
     arr = np.array(rgba)
     alpha = arr[:, :, 3]
-    alpha[alpha < alpha_threshold] = 0
-    alpha[alpha > solid_alpha_threshold] = 255
+    # 🌟 修正：移除手動二值化 Alpha 的操作，直接使用原始的 Alpha。
 
     try:
         from scipy import ndimage
-
         mask = alpha > 0
         labels, count = ndimage.label(mask)
         if count:
             sizes = np.bincount(labels.ravel())
+            # 🌟 修正：大幅減小清理比例，防止咬肉
             min_area = max(12, int(mask.size * min_component_ratio))
             keep = sizes >= min_area
             keep[0] = False
@@ -272,8 +273,10 @@ def clean_cutout_alpha(
     except Exception:
         pass
 
-    edge = Image.fromarray(alpha, mode="L").filter(ImageFilter.MedianFilter(size=3))
-    arr[:, :, 3] = np.array(edge)
+    # 🌟 修正：移除 MedianFilter，讓邊緣變銳利
+    # Smooth only the cutout edge after removing specks.
+    # edge = Image.fromarray(alpha, mode="L").filter(ImageFilter.MedianFilter(size=3))
+    # arr[:, :, 3] = np.array(edge)
     arr[arr[:, :, 3] == 0, :3] = 255
     return Image.fromarray(arr, mode="RGBA")
 
@@ -282,37 +285,31 @@ def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
+    # 🌟 啟用專門針對電商產品優化的 ISNet 模型
     session = new_session("isnet-general-use")
     
     with Image.open(input_path) as img:
         rgba = img.convert("RGBA")
         
+        # 攔截 rembg 的後台輸出
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
             
-            # 1. 產生標準硬邊緣去背圖 (這步 rembg 會處理好顏色)
+            # 1. 產生標準硬邊緣去背圖 (保持硬邊緣 alpha_matting=False)
             cutout = remove(
                 rgba,
                 session=session,
-                alpha_matting=False,
+                alpha_matting=False, # 👈 🌟 修正不銳利：確保硬邊緣
                 post_process_mask=True
             )
             
-            # 2. 邊緣平滑處理
-            alpha = cutout.split()[3]
-            smoothed_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.5))
+            # 🌟 修正：完全刪除高斯模糊平滑後處理，讓邊緣變銳利
             
-            # 👇 🌟 【關鍵修正：解決黑邊問題】 🌟 👇
-            # 分離 RGBA 圖層，丟棄舊的 Alpha
-            r, g, b, _ = cutout.split()
-            # 使用原始 R、G、B 通道與新的平滑 Alpha 合併
-            # 避免使用 convert("RGB")，因為它預設會與黑色合成
-            final_img = Image.merge("RGBA", (r, g, b, smoothed_alpha))
-            
+    # 👇 🌟 【關鍵修正：直接使用原始的 cutout，修正黑邊問題】 🌟 👇
     try:
-        return clean_cutout_alpha(final_img)
+        return clean_cutout_alpha(cutout)
     except NameError:
-        return final_img
+        return cutout
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
@@ -320,13 +317,18 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
     alpha = rgba.getchannel("A")
     bbox = alpha.getbbox()
     
+    # 1. 將圖片的透明多餘邊界全部裁切掉，只留下商品本體
     if bbox:
         rgba = rgba.crop(bbox)
 
+    # 2. 依照商品「真實的長寬比例」，各自加上留白 (不再強制做成正方形)
     new_width = rgba.width + padding * 2
     new_height = rgba.height + padding * 2
 
+    # 3. 建立這個「完全合身」的透明畫布 (可能是長方形或正方形，依商品形狀而定)
     canvas = Image.new("RGBA", (new_width, new_height), (255, 255, 255, 0))
+    
+    # 4. 把商品貼在正中間
     canvas.alpha_composite(rgba, (padding, padding))
     
     return canvas
@@ -416,7 +418,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="CSV 檔案路徑，或 Google Sheets 發布後的 CSV URL")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="輸出資料夾")
     parser.add_argument("--report", type=Path, default=Path("output/report.csv"), help="報表路徑")
-    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 邊長")
+    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 边长")
     parser.add_argument("--padding", type=int, default=24, help="商品與畫布邊界留白")
     parser.add_argument("--keep-original", action="store_true", help="保留下載的原始候選圖")
     parser.add_argument("--min-delay", type=float, default=DEFAULT_DELAY[0], help="每個商品處理後最短等待秒數")

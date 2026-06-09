@@ -46,8 +46,7 @@ class Candidate:
     white_ratio: float = 0.0
     edge_white_ratio: float = 0.0
     center_content_ratio: float = 0.0
-    # 新增：物件密度分，用來 deprioritize 複合情境圖
-    compoundedness_score: float = 0.0 
+    compoundedness_score: float = 1.0 
     note: str = ""
 
 
@@ -61,7 +60,6 @@ def normalize_image_url(src: str) -> str:
 
 
 def read_product_ids(input_value: str) -> list[str]:
-    # 🌟 優化：支援在 ID 列表中包含英文、數字、連字號
     if input_value.startswith("http://") or input_value.startswith("https://"):
         response = requests.get(input_value, timeout=30, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
@@ -201,9 +199,7 @@ def center_content_ratio(img: Image.Image) -> float:
     return non_white
 
 
-# 新增：計算物件密度分的輔助函數
 def get_object_compoundedness(img: Image.Image) -> float:
-    """計算中央 70% 區域的非白物件是否存在分散狀況 (複合圖偵測)。"""
     rgb = img.convert("RGB")
     w, h = rgb.size
     crop = rgb.crop((int(w * 0.15), int(h * 0.15), int(w * 0.85), int(h * 0.85)))
@@ -226,9 +222,6 @@ def get_object_compoundedness(img: Image.Image) -> float:
             
         return float(max_size / total_non_white_size)
         
-    except ImportError:
-        # 如果找不到 scipy，放棄此評分項目
-        return 1.0
     except Exception:
         return 1.0
 
@@ -250,37 +243,28 @@ def score_candidate(candidate: Candidate, product_id: str) -> None:
     pid = product_id.lower()
     score = 0.0
     
-    # --- 秤：專業評分與權重配比 (已針對複合情境圖優化) ---
-    score += candidate.edge_white_ratio * 30    # 👈 保持關鍵權重
-    score += candidate.white_ratio * 10         # 👈 白底很重要，但 composite 圖也很白，故權重不宜過高
-    score += min(candidate.center_content_ratio, 0.65) * 20 # 👈 確保有東西在中央
+    score += candidate.edge_white_ratio * 30    
+    score += candidate.white_ratio * 10         
+    score += min(candidate.center_content_ratio, 0.65) * 20 
     
-    # 1. PID 檔案名稱精準 bonus (最強效)
     if stem == pid:
         score += 15
         
-    # 2. 檔案名稱包含 Context/Banner/情境/詳細資料之類的 composite 關鍵字懲罰 🌟 (修正 image_12.png)
-    # 檔名只要包含情境、 banner 、 spec 這種詞，大概就是 image_12.png 那種圖
-    harsh_context_keywords = ["context", "banner", "bn", "情境", "詳細", "詳細資料", "規格", "spec", "specs", "detail", "details", "banner", "size"]
+    harsh_context_keywords = ["context", "banner", "bn", "情境", "詳細", "詳細資料", "規格", "spec", "specs", "detail", "details", "size"]
     if any(kw in name for kw in harsh_context_keywords):
-        score -= 80 # 👈 極致懲罰
+        score -= 80 
 
-    # 3. 檔案stem 包含 PID 但帶有 01/02 序號的懲罰
     elif re.fullmatch(rf"{re.escape(pid)}[_-]?(0?1|10)", stem):
         score -= 45
     elif re.fullmatch(rf"{re.escape(pid)}[_-]\d+", stem):
         score -= 8
 
-    # 4. 物件密度懲罰 🌟 (修正 image_12.png)
-    # 真正的商品主圖應該是單一、巨大物件， compoundedness_score 應該接近 1.0
-    # 如果低於 0.65 (例如 12.png 右邊散落很多文字)，直接扣除重分
     if candidate.compoundedness_score < 0.65:
-        score -= 80 # 👈 極致懲罰
+        score -= 80 
 
     if candidate.source == "product.images":
-        score += 12
+        score += 80
         
-    # 5. 檔案名稱bonus
     if re.fullmatch(r"\d+(_\d+)?\.(jpg|jpeg|png|webp)", name, re.IGNORECASE):
         score += 8
     if re.search(r"^\d+[_-]", name):
@@ -296,130 +280,63 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
         score_candidate(candidate, product_id)
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
-    
-    # --- 🌟 優化：拔除對 Petpetgo 設置的「猶豫煞車」---
-    # 告訴程式：「不管 Petpetgo 的圖分數接近不接近，你就選分數最高（第一名）的那張去背就對了！」
-    # 這能確保正確的圖片能被挑選出來，而不會一直卡在 needs_review 狀態。
     return best, "success", "自動挑選 (已關閉人工審核)"
-
-
-def clean_cutout_alpha(
-    img: Image.Image,
-    # 🌟 優化：配合 Alpha Matting，大幅降低這些閾值，防止把半透明邊緣「強行關燈」變成鋸齒。
-    alpha_threshold: int = 12,        # 👈 👈 👈 原本 24 -> 改 12，保留更多極淡的邊緣
-    solid_alpha_threshold: int = 250, # 👈 原本 245 -> 改 250，更嚴格才判斷為完全不透明
-    min_component_ratio: float = 0.000005, # 👈 原本 0.00008 -> 改極小，防止咬肉
-) -> Image.Image:
-    rgba = img.convert("RGBA")
-    arr = np.array(rgba)
-    alpha = arr[:, :, 3]
-    # 手動二值化核心 Alpha，讓主體更飽滿
-    alpha[alpha < alpha_threshold] = 0
-    alpha[alpha > solid_alpha_threshold] = 255
-
-    try:
-        from scipy import ndimage
-
-        mask = alpha > 0
-        labels, count = ndimage.label(mask)
-        if count:
-            sizes = np.bincount(labels.ravel())
-            min_area = max(10, int(mask.size * min_component_ratio))
-            keep = sizes >= min_area
-            keep[0] = False
-            alpha[~keep[labels]] = 0
-    except Exception:
-        pass
-
-    arr[:, :, 3] = alpha
-    # 🌟 優化：移除之前加上的「強硬羽化器」ImageFilter.MedianFilter。
-    # 現在依賴 rembg 高級的 matting 在去背當下就做好平滑。
-    return Image.fromarray(arr, mode="RGBA")
 
 
 def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
-    # 🌟 啟用專門針對電商產品優化的 ISNet 模型
-    session = new_session("isnet-general-use")
+    # 🌟 1. 換回預設的最穩模型 u2net (防破圖、防咬肉最佳)
+    session = new_session("u2net")
     
     with Image.open(input_path) as img:
-        rgba = img.convert("RGBA")
+        # 確保原圖存在，這張圖從頭到尾都不會被 AI 破壞顏色
+        original_rgba = img.convert("RGBA")
         
-        # 攔截 rembg 的後台輸出
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
             
-            # 👇 🌟 【最終體核心修正：引入高級阿法遮罩 (Alpha Matting)】 🌟 👇
-            # 啟用 alpha_matting 並細調參數，讓邊緣平滑自然的同時，**完全禁用 AI 的「腐蝕」功能！**。
-            cutout = remove(
-                rgba,
+            # 🌟 2. 終極殺招：只拿 Mask！
+            # 關閉所有危險的 alpha_matting，只要求 AI 給一張黑白遮罩
+            mask = remove(
+                original_rgba,
                 session=session,
-                # --- ✨ 精細平滑設定 (專業救星) ---
-                alpha_matting=True, # 👈 🌟 核心：開啟高級邊緣平滑 (阿法罩衫)
-                alpha_matting_foreground_threshold=240, # 👈 高於此值判斷為「確定是商品」，要飽滿
-                alpha_matting_background_threshold=10,  # 👈 低於此值判斷為「確定是背景」，要透明
-                alpha_matting_erode_size=0,             # 👈 👈 👈 控制「咬肉」範圍的腐蝕大小。
-                                                      # 原預設 25 咬太多，之前的修正 10 也咬太多。**改為 0（禁用腐蝕）！🌟**。
-                                                      # 唯有 0，才能完美保留 13.png 包裝文字和點點細節！
-                # -----------------------
-                post_process_mask=True # 👈 保留後處理，修補 mask 裡的洞
+                only_mask=True,        # 👈 核心關鍵：只輸出遮罩，不碰顏色！
+                post_process_mask=True # 補內部破洞
             )
             
-    # 👇 🌟 【關鍵修正：直接合併分離的 RGB 通道，解決 convert("RGB") 的黑邊陷阱】 🌟 👇
-    # pillow 的 convert("RGB") 在處理透明 RGBA 時，預設會把半透明區域與「黑色」合成。
-    # 這就是為什麼去背圖上會有一圈黑灰色的鋸齒黑邊。
+    # 🌟 3. 處理 Mask 消除鋸齒 (因為是處理黑白遮罩，絕對不會有黑邊)
+    mask = mask.convert("L")
+    # 輕微高斯模糊，讓邊緣滑順不鋸齒
+    smoothed_mask = mask.filter(ImageFilter.GaussianBlur(radius=1.0))
     
-    # 分離出 cutout 後的 4 個通道，只保留 R, G, B 原始顏色資料
-    r, g, b, alpha_from_cutout = cutout.split()
-    # 重新組合，維持 R, G, B 原始顏色，使用剛剛去背產生的平滑 Alpha
-    rgba_correct = Image.merge("RGBA", (r, g, b, alpha_from_cutout))
+    # 🌟 4. 將完美的遮罩，套用回「完全沒被破壞過」的原始圖片上
+    original_rgba.putalpha(smoothed_mask)
     
-    # 這裡呼叫修正過閾值的 clean_cutout_alpha 做最後的雜點清理
-    try:
-        return clean_cutout_alpha(rgba_correct)
-    except NameError:
-        return rgba_correct
+    # 直接輸出，不再經過任何危險的 clean_cutout_alpha 清理函數，徹底防止咬肉
+    return original_rgba
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
-    # 🌟 核心修正：使用完整帶有顏色資料和 Alpha 資料的圖片，而不是只用 Alpha。
-    # rgba = img.convert("RGBA") # 舊的笨方法
+    # 🌟 使用更安全的 Numpy 裁切法，防破圖
+    arr = np.array(img)
+    alpha = arr[:, :, 3]
     
-    alpha = img.getchannel("A") # 提取新產生的柔和 Alpha 軌道
-    bbox = alpha.getbbox()
+    # 找出所有透明度大於 10 的像素 (忽略極淡的邊緣或雜訊)
+    rows = np.any(alpha > 10, axis=1)
+    cols = np.any(alpha > 10, axis=0)
     
-    # 🌟 修正「白把手殘留」：裁切多餘背景時要以這個柔和 Alpha 為準。
-    # 如果 top Handle 有白邊沒咬乾淨， crop 完依然會帶有把手的透明度 bbox
-    
-    # Pillow 的 getbbox 會忽略完全透明的邊緣。如果 top handle 周圍有 1% 透明度的白色像素， crop 會失敗。
-    # 我們需要更勇敢的 getbbox，手動二值化 Alpha 以獲得乾淨 bbox，然後再裁切「原始柔和圖」。
-    
-    # 手動建立一個二值化 Alpha 以獲得乾淨 bbox
-    arr_alpha = np.array(alpha)
-    strict_alpha = arr_alpha.copy()
-    strict_alpha[strict_alpha < 100] = 0 # 高閾值二值化：低於 100 通通判斷為透明背景
-    bbox_strict = Image.fromarray(strict_alpha, mode="L").getbbox()
-    
-    # 1. 狀況：如果物件太小（例如抓錯圖變成了雜點），就保持原樣，不要大放大，以防咬肉過頭。
-    if not bbox_strict:
-        # 如果嚴格 Alpha 判定什麼都沒有，可能是雜點，不處理，以防吃肉
-        pass
-    else:
-        # 使用嚴格bbox裁切原始「柔和圖」🌟
-        cropped_rgba = img.crop(bbox_strict)
-        img = cropped_rgba
+    if rows.any() and cols.any():
+        ymin, ymax = np.where(rows)[0][[0, -1]]
+        xmin, xmax = np.where(cols)[0][[0, -1]]
+        # 裁切多餘透明區域
+        img = img.crop((xmin, ymin, xmax + 1, ymax + 1))
 
-    # 2. 依照商品「真實的長寬比例」，各自加上留白 (不再強制做成正方形)
     new_width = img.width + padding * 2
     new_height = img.height + padding * 2
 
-    # 3. 建立這個「完全合身」的透明畫布 (可能是長方形或正方形，依商品形狀而定)
     canvas = Image.new("RGBA", (new_width, new_height), (255, 255, 255, 0))
-    
-    # 4. 把商品貼在正中間：使用 pillow 的 alpha_composite 方法將柔和 RGBA 貼上畫布🌟
-    # 這樣邊緣的柔和透明度才能與透明畫布融合，消除黑邊。
     canvas.alpha_composite(img, (padding, padding))
     
     return canvas
@@ -509,8 +426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="CSV 檔案路徑，或 Google Sheets 發布後的 CSV URL")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="輸出資料夾")
     parser.add_argument("--report", type=Path, default=Path("output/report.csv"), help="報表路徑")
-    # 🌟 優化： size 功能在 app.py 裡設定為自動忽略，這裡保留參數但沒實質作用。
-    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 大小（雲端版已自動合身不限此尺寸）")
+    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 大小")
     parser.add_argument("--padding", type=int, default=24, help="商品與畫布邊界留白")
     parser.add_argument("--keep-original", action="store_true", help="保留下載的原始候選圖")
     parser.add_argument("--min-delay", type=float, default=DEFAULT_DELAY[0], help="每個商品處理後最短等待秒數")

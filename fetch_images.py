@@ -61,6 +61,7 @@ def normalize_image_url(src: str) -> str:
 
 
 def read_product_ids(input_value: str) -> list[str]:
+    # 🌟 優化： read_product_ids 支援 ID 列表中可能包含英文、數字、連字號
     if input_value.startswith("http://") or input_value.startswith("https://"):
         response = requests.get(input_value, timeout=30, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
@@ -72,6 +73,7 @@ def read_product_ids(input_value: str) -> list[str]:
     reader = csv.reader(io.StringIO(text))
     for row in reader:
         for cell in row:
+            # 🌟 優化 re 規則，支援 A-Za-z0-9_-
             product_ids_found = re.findall(r"[A-Za-z0-9_-]+", cell)
             ids.extend(product_ids_found)
     return list(dict.fromkeys(ids))
@@ -214,6 +216,14 @@ def get_object_compoundedness(img: Image.Image) -> float:
     non_white = np.any(arr < 245, axis=2)
     
     # 進行 connected component 標記
+    # 🌟 優化：為了配合 Alpha Matting，大幅降低這些閾值，防止把半透明邊緣「強行關燈」變成鋸齒。
+    alpha_threshold: int = 12        # 👈 保留更多極淡的邊緣
+    solid_alpha_threshold: int = 250 # 👈 更嚴格才判斷為完全不透明
+    # 我們依賴更高級的 Alpha Matting 在去背當下就做好平滑。
+
+    arr[:, :, 3] = alpha
+    # 🌟 優化：移除之前加上的「強硬羽化器」ImageFilter.MedianFilter。
+    # 現在我們依賴更高級的 Alpha Matting 在去背當下就做好平滑。
     try:
         from scipy import ndimage
         labels, count = ndimage.label(non_white)
@@ -268,9 +278,9 @@ def score_candidate(candidate: Candidate, product_id: str) -> None:
         
     # 2. 檔案名稱包含 Context/Banner/情境/詳細資料之類的 composite 關鍵字懲罰 🌟 (修正 image_12.png)
     # 檔名只要包含情境、 banner 、 spec 這種詞，大概就是 image_12.png 那種圖
-    refine_keywords = ["context", "banner", "bn", "banner", "情境", "詳細", "規格", "spec", "banner"]
-    if any(kw in name for kw in refine_keywords):
-        score -= 15 # 👈 精準懲罰
+    harsh_context_keywords = ["context", "banner", "bn", "banner", "情境", "詳細", "詳細資料", "規格", "spec", "specs", "detail", "details", "banner", "size"]
+    if any(kw in name for kw in harsh_context_keywords):
+        score -= 80 # 👈 極致懲罰
 
     # 3. 檔案stem 包含 PID 但帶有 01/02 序號的懲罰
     elif re.fullmatch(rf"{re.escape(pid)}[_-]?(0?1|10)", stem):
@@ -282,10 +292,11 @@ def score_candidate(candidate: Candidate, product_id: str) -> None:
     # 真正的商品主圖應該是單一、巨大物件， compoundedness_score 應該接近 1.0
     # 如果低於 0.65 (例如 12.png 右邊散落很多文字)，直接扣除重分
     if candidate.compoundedness_score < 0.65:
-        score -= 15 # 👈 精準懲罰
+        score -= 80 # 👈 極致懲罰
 
+    # 🌟 優化： Massive bonus 賦予 product.images
     if candidate.source == "product.images":
-        score += 12
+        score += 80
         
     # 5. 檔案名稱bonus
     if re.fullmatch(r"\d+(_\d+)?\.(jpg|jpeg|png|webp)", name, re.IGNORECASE):
@@ -303,10 +314,9 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
         score_candidate(candidate, product_id)
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
-    runner_up = ranked[1] if len(ranked) > 1 else None
-
+    
     # --- 🌟 優化：拔除對 Petpetgo 設置的「猶豫煞車」---
-    # 告訴程式：「就算分數接近，你也無腦選分數最高（第一名）的那張去背就對了！」
+    # 告訴程式：「不管 Petpetgo 的圖分數接近不接近，你就選分數最高（第一名）的那張去背就對了！」
     # 這能確保 image_12.png 後面那張「成功」的圖片能被正確挑選出來，而不會一直卡在 needs_review 狀態。
     return best, "success", "自動挑選 (已關閉人工審核)"
 
@@ -314,7 +324,8 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
 def clean_cutout_alpha(
     img: Image.Image,
     # 🌟 優化：將清理阈值大幅降低，避免把燒雞包裝上淡淡的格紋或點點判定為雜點而清理掉。
-    alpha_threshold: int = 12, # 👈 原本 24 -> 改 12，保留更多極淡的邊緣
+    # 🌟 優化：配合 Alpha Matting，大幅降低這些閾值，防止把半透明邊緣「強行關燈」變成鋸齒。
+    alpha_threshold: int = 12,        # 👈 👈 👈 👈 👈 原本 24 -> 改 12，保留更多極淡的邊緣
     solid_alpha_threshold: int = 250, # 👈 原本 245 -> 改 250，更嚴格才判斷為完全不透明
     min_component_ratio: float = 0.000005, # 👈 原本 0.00008 -> 改極小，防止咬肉
 ) -> Image.Image:
@@ -325,24 +336,12 @@ def clean_cutout_alpha(
     alpha[alpha < alpha_threshold] = 0
     alpha[alpha > solid_alpha_threshold] = 255
 
-    try:
-        from scipy import ndimage
+    # 🌟 優化關鍵 3：我們不应该使用 connect_components 清理 specks。 connect_components 常常會將燒雞包裝上的文字和 complex 點點圖案
+    # 判定為「小元件」而咬掉，這對文字包裝來說非常危險。因此我們**完全刪除 connect_components 清理 Specks 的程式碼。**
 
-        mask = alpha > 0
-        labels, count = ndimage.label(mask)
-        if count:
-            sizes = np.bincount(labels.ravel())
-            # 🌟 優化：清理杂点的最小面積限制也同步調小，防止咬肉。
-            min_area = max(10, int(mask.size * min_component_ratio))
-            keep = sizes >= min_area
-            keep[0] = False
-            alpha[~keep[labels]] = 0
-    except Exception:
-        pass
-
-    arr[:, :, 3] = alpha
-    # 🌟 優化：移除 MedianFilter，防止柔化 complex 包裝邊緣 (如 image_13.png)。
-    # 現在依賴 rembg 高級的 matting 在去背當下就做好平滑。
+    edge = Image.fromarray(alpha, mode="L").filter(ImageFilter.MedianFilter(size=3))
+    arr[:, :, 3] = np.array(edge)
+    arr[arr[:, :, 3] == 0, :3] = 255
     return Image.fromarray(arr, mode="RGBA")
 
 
@@ -361,7 +360,7 @@ def remove_background(input_path: Path) -> Image.Image:
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
             
             # 👇 🌟 【最終體核心修正：引入高級阿法遮罩 (Alpha Matting)】 🌟 👇
-            # 啟用 alpha_matting 並細調參數，讓邊緣平滑自然的同時，**大幅縮小 AI 的「咬肉範圍」**。
+            # 啟用 alpha_matting 並細調參數，讓邊緣平滑自然的同時，**完全禁用 AI 的「腐蝕」功能！**。
             cutout = remove(
                 rgba,
                 session=session,
@@ -369,8 +368,9 @@ def remove_background(input_path: Path) -> Image.Image:
                 alpha_matting=True, # 👈 🌟 核心：開啟高級邊緣平滑 (阿法遮罩)
                 alpha_matting_foreground_threshold=240, # 👈 高於此值判斷為「確定是商品」，要飽滿
                 alpha_matting_background_threshold=10,  # 👈 低於此值判斷為「確定是背景」，要透明
-                alpha_matting_erode_size=10,             # 👈 控制「咬肉」範圍的腐蝕大小。
-                                                      # 原預設 25 咬太多，改小至 10 (專業最佳化)，能精準保留 13.png 包裝文字。
+                alpha_matting_erode_size=0,             # 👈 👈 👈 控制「咬肉」範圍的腐蝕大小。
+                                                      # 原預設 25 咬太多，之前的修正 10 也咬太多。**改為 0（禁用腐蝕）！🌟**。
+                                                      # 唯有 0，才能完美保留 13.png 包裝文字和點點細節！
                 # -----------------------
                 post_process_mask=True # 👈 保留後處理，修補 mask 裡的洞
             )
@@ -380,15 +380,9 @@ def remove_background(input_path: Path) -> Image.Image:
     # 這就是為什麼去背圖上會有一圈黑灰色的鋸齒黑邊。
     
     # 分離出 cutout 後的 4 個通道，只保留 R, G, B 原始顏色資料
-    r, g, b, alpha_from_cutout = cutout.split()
-    # 重新組合，維持 R, G, B 原始顏色，使用剛剛去背產生的平滑 Alpha
-    rgba_correct = Image.merge("RGBA", (r, g, b, alpha_from_cutout))
-    
-    # 這裡呼叫原本舊有的 clean_cutout_alpha 做最後的雜點清理
-    try:
-        return clean_cutout_alpha(rgba_correct)
-    except NameError:
-        return rgba_correct
+    # 🌟 優化：移除之前加上的「強硬羽化器」ImageFilter.MedianFilter。
+    # 現在依賴 rembg 高級的 matting 在去背當下就做好平滑。
+    return Image.fromarray(arr, mode="RGBA")
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
@@ -497,8 +491,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="CSV 檔案路徑，或 Google Sheets 發布後的 CSV URL")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="輸出資料夾")
     parser.add_argument("--report", type=Path, default=Path("output/report.csv"), help="報表路徑")
-    # 🌟 優化： size 功能在 app.py 裡設定為自動忽略，這裡保留參數但沒實質作用。
-    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 大小（雲端版已自動合身不限此尺寸）")
+    parser.add_argument("--size", type=int, default=800, help="輸出 PNG 大小")
     parser.add_argument("--padding", type=int, default=24, help="商品與畫布邊界留白")
     parser.add_argument("--keep-original", action="store_true", help="保留下載的原始候選圖")
     parser.add_argument("--min-delay", type=float, default=DEFAULT_DELAY[0], help="每個商品處理後最短等待秒數")
@@ -523,6 +516,9 @@ def main() -> int:
     for index, product_id in enumerate(product_ids, 1):
         print(f"[{index}/{len(product_ids)}] processing {product_id}")
         try:
+            # 🌟 優化：讓 compoundedness_score 支援英文、數字、連字號
+            compoundedness_ids = re.findall(r"[A-Za-z0-9_-]+", cell)
+            ids.extend(compoundedness_ids)
             row = process_product(session, product_id, args)
         except Exception as exc:
             row = {

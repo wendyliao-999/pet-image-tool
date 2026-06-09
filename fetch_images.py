@@ -287,50 +287,47 @@ def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
-    # 🌟 1. 換回預設的最穩模型 u2net (防破圖、防咬肉最佳)
     session = new_session("u2net")
     
     with Image.open(input_path) as img:
-        # 確保原圖存在，這張圖從頭到尾都不會被 AI 破壞顏色
         original_rgba = img.convert("RGBA")
         
         quiet_output = io.StringIO()
         with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
-            
-            # 🌟 2. 終極殺招：只拿 Mask！
-            # 關閉所有危險的 alpha_matting，只要求 AI 給一張黑白遮罩
+            # 取得純黑白遮罩
             mask = remove(
                 original_rgba,
                 session=session,
-                only_mask=True,        # 👈 核心關鍵：只輸出遮罩，不碰顏色！
-                post_process_mask=True # 補內部破洞
+                only_mask=True,
+                post_process_mask=True
             )
             
-    # 🌟 3. 處理 Mask 消除鋸齒 (因為是處理黑白遮罩，絕對不會有黑邊)
     mask = mask.convert("L")
-    # 輕微高斯模糊，讓邊緣滑順不鋸齒
-    smoothed_mask = mask.filter(ImageFilter.GaussianBlur(radius=1.0))
     
-    # 🌟 4. 將完美的遮罩，套用回「完全沒被破壞過」的原始圖片上
+    # 🌟【超級關鍵：消除原圖白底帶來的白邊】🌟
+    # 先使用 MinFilter(3) 讓白色遮罩向內收縮（侵蝕）約 1 像素，把原圖邊緣的白底像素徹底切除
+    eroded_mask = mask.filter(ImageFilter.MinFilter(3))
+    
+    # 收縮完後，再做非常輕微的模糊，保證邊緣滑順、不生硬、不鋸齒
+    smoothed_mask = eroded_mask.filter(ImageFilter.GaussianBlur(radius=0.6))
+    
+    # 將這張完美乾淨的遮罩放回原圖上
     original_rgba.putalpha(smoothed_mask)
     
-    # 直接輸出，不再經過任何危險的 clean_cutout_alpha 清理函數，徹底防止咬肉
     return original_rgba
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
-    # 🌟 使用更安全的 Numpy 裁切法，防破圖
     arr = np.array(img)
     alpha = arr[:, :, 3]
     
-    # 找出所有透明度大於 10 的像素 (忽略極淡的邊緣或雜訊)
-    rows = np.any(alpha > 10, axis=1)
-    cols = np.any(alpha > 10, axis=0)
+    # 調整判定閾值，只對有實體顏色的區域進行裁切
+    rows = np.any(alpha > 50, axis=1)
+    cols = np.any(alpha > 50, axis=0)
     
     if rows.any() and cols.any():
         ymin, ymax = np.where(rows)[0][[0, -1]]
         xmin, xmax = np.where(cols)[0][[0, -1]]
-        # 裁切多餘透明區域
         img = img.crop((xmin, ymin, xmax + 1, ymax + 1))
 
     new_width = img.width + padding * 2

@@ -20,6 +20,14 @@ if "task_completed" not in st.session_state:
     st.session_state.successful_files = []
     st.session_state.result_rows = []
 
+
+def refresh_successful_files():
+    st.session_state.successful_files = [
+        r["final_path"]
+        for r in st.session_state.result_rows
+        if r.get("final_path") and Path(r["final_path"]).exists()
+    ]
+
 # --- 2. 左側邊欄設定區 ---
 st.sidebar.header("⚙️ 進階設定")
 size = st.sidebar.number_input("輸出圖片大小 (px)", min_value=100, max_value=2000, value=800)
@@ -32,6 +40,16 @@ class UIArgs:
         self.size = size
         self.padding = padding
         self.keep_original = False
+
+
+def make_final_from_review_choice(product_id, image_path, args):
+    removed = fi.remove_background(image_path)
+    final = fi.fit_to_canvas(removed, size=args.size, padding=args.padding)
+
+    args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
+    final_file = args.output_dir / "final" / f"{product_id}.png"
+    final.save(final_file)
+    return final_file
 
 # --- ✨ 寵物公園專屬抓圖引擎 ---
 def process_petpark(product_id, args):
@@ -121,6 +139,8 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
                             row["final_path"], 
                             caption=f"✅ {row['product_id']} 完成"
                         )
+                    elif row.get("status") == "needs_review":
+                        st.warning(f"⚠️ ID {pid} 需要人工確認：{row.get('reject_reason') or row.get('confidence_note')}")
                 except Exception as exc:
                     row = {"product_id": pid, "status": "failed", "error": str(exc)}
                     st.error(f"❌ ID {pid} 處理失敗: {exc}")
@@ -132,28 +152,76 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
             st.balloons()
             
             # --- 關鍵：把成功抓到的圖片清單「記在腦海裡 (Session State)」---
-            st.session_state.successful_files = [r["final_path"] for r in rows if r.get("final_path") and Path(r["final_path"]).exists()]
             st.session_state.result_rows = rows
+            refresh_successful_files()
             st.session_state.task_completed = True
 
 # --- 5. 獨立的下載區塊 (完全不受重整影響) ---
-if st.session_state.task_completed and st.session_state.successful_files:
+if st.session_state.task_completed:
     st.markdown("---")
-    st.markdown("### 🎁 打包下載區")
+    st.markdown("### 📋 處理結果")
     
     # 顯示報表
     st.dataframe(st.session_state.result_rows, use_container_width=True)
+
+    review_rows = [r for r in st.session_state.result_rows if r.get("status") == "needs_review"]
+    if review_rows:
+        st.markdown("### 🔎 需要人工確認")
+        st.caption("請選擇正確的純商品圖。按下「使用這張」後，系統會立刻去背並加入下載包。")
+
+        args = UIArgs()
+        for row in review_rows:
+            product_id = str(row.get("product_id", ""))
+            review_dir = args.output_dir / "review" / product_id
+            st.markdown(f"#### ID {product_id}")
+            st.warning(row.get("reject_reason") or row.get("confidence_note") or "此商品需要人工確認")
+
+            candidate_paths = [
+                p for p in sorted(review_dir.iterdir())
+                if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+            ] if review_dir.exists() else []
+
+            if not candidate_paths:
+                st.info("找不到候選圖，請重新執行這筆商品。")
+                continue
+
+            cols = st.columns(min(4, len(candidate_paths)))
+            for idx, image_path in enumerate(candidate_paths[:8]):
+                col = cols[idx % len(cols)]
+                with col:
+                    st.image(str(image_path), caption=image_path.name, use_container_width=True)
+                    if st.button("使用這張", key=f"use_{product_id}_{idx}_{image_path.name}"):
+                        try:
+                            final_file = make_final_from_review_choice(product_id, image_path, args)
+                            for existing_row in st.session_state.result_rows:
+                                if str(existing_row.get("product_id")) == product_id:
+                                    existing_row["status"] = "success_manual"
+                                    existing_row["final_path"] = str(final_file)
+                                    existing_row["selected_name"] = image_path.name
+                                    existing_row["confidence_note"] = "人工選圖"
+                                    existing_row["reject_reason"] = ""
+                                    break
+                            refresh_successful_files()
+                            st.success(f"已使用 {image_path.name} 產生去背圖")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"去背失敗：{exc}")
+
+    if st.session_state.successful_files:
+        st.markdown("### 🎁 打包下載區")
     
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for file_path in st.session_state.successful_files:
-            zip_file.write(file_path, Path(file_path).name)
-    
-    # 我也順便幫你優化了按鈕文字，讓你可以看到總共包了幾張圖進去！
-    st.download_button(
-        label=f"📦 一鍵下載 {len(st.session_state.successful_files)} 張去背圖片 (ZIP 壓縮檔)",
-        data=zip_buffer.getvalue(),
-        file_name="pet_images_output.zip",
-        mime="application/zip",
-        use_container_width=True
-    )
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in st.session_state.successful_files:
+                zip_file.write(file_path, Path(file_path).name)
+        
+        # 我也順便幫你優化了按鈕文字，讓你可以看到總共包了幾張圖進去！
+        st.download_button(
+            label=f"📦 一鍵下載 {len(st.session_state.successful_files)} 張去背圖片 (ZIP 壓縮檔)",
+            data=zip_buffer.getvalue(),
+            file_name="pet_images_output.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
+    else:
+        st.info("目前還沒有可下載的完成圖片。")

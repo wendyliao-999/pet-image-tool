@@ -4,6 +4,7 @@ import contextlib
 import csv
 import io
 import json
+import os
 import random
 import re
 import sys
@@ -18,6 +19,8 @@ import requests
 from bs4 import BeautifulSoup
 import numpy as np
 from PIL import Image, ImageFilter
+
+os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(__file__).resolve().parent / ".numba_cache"))
 
 try:
     from rembg import remove, new_session
@@ -47,7 +50,11 @@ class Candidate:
     edge_white_ratio: float = 0.0
     center_content_ratio: float = 0.0
     compoundedness_score: float = 1.0 
+    bottom_band_ratio: float = 0.0
+    bottom_band_span: float = 0.0
+    side_white_min: float = 0.0
     note: str = ""
+    reject_reason: str = ""
 
 
 def normalize_image_url(src: str) -> str:
@@ -71,8 +78,10 @@ def read_product_ids(input_value: str) -> list[str]:
     reader = csv.reader(io.StringIO(text))
     for row in reader:
         for cell in row:
-            product_ids_found = re.findall(r"[A-Za-z0-9_-]+", cell)
-            ids.extend(product_ids_found)
+            match = re.search(r"\d+", cell)
+            if match:
+                ids.append(match.group(0))
+                break
     return list(dict.fromkeys(ids))
 
 
@@ -191,6 +200,31 @@ def edge_white_ratio(img: Image.Image) -> float:
     return float(np.mean(white))
 
 
+def side_white_ratios(img: Image.Image) -> dict[str, float]:
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    margin = max(1, int(min(w, h) * 0.08))
+    regions = {
+        "top": rgb.crop((0, 0, w, margin)),
+        "bottom": rgb.crop((0, h - margin, w, h)),
+        "left": rgb.crop((0, 0, margin, h)),
+        "right": rgb.crop((w - margin, 0, w, h)),
+    }
+    return {side: ratio_white(region) for side, region in regions.items()}
+
+
+def bottom_band_metrics(img: Image.Image) -> tuple[float, float]:
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    band_h = max(1, int(h * 0.18))
+    band = rgb.crop((0, h - band_h, w, h))
+    arr = np.asarray(band)
+    non_white = np.any(arr < 245, axis=2)
+    non_white_ratio = float(np.mean(non_white))
+    column_span = float(np.mean(np.any(non_white, axis=0)))
+    return non_white_ratio, column_span
+
+
 def center_content_ratio(img: Image.Image) -> float:
     rgb = img.convert("RGB")
     w, h = rgb.size
@@ -237,6 +271,9 @@ def score_candidate(candidate: Candidate, product_id: str) -> None:
         candidate.edge_white_ratio = edge_white_ratio(img)
         candidate.center_content_ratio = center_content_ratio(img)
         candidate.compoundedness_score = get_object_compoundedness(img)
+        candidate.bottom_band_ratio, candidate.bottom_band_span = bottom_band_metrics(img)
+        side_ratios = side_white_ratios(img)
+        candidate.side_white_min = min(side_ratios.values())
 
     name = candidate.name.lower()
     stem = Path(candidate.name).stem.lower()
@@ -262,6 +299,11 @@ def score_candidate(candidate: Candidate, product_id: str) -> None:
     if candidate.compoundedness_score < 0.65:
         score -= 80 
 
+    if candidate.bottom_band_ratio > 0.28 and candidate.bottom_band_span > 0.72:
+        score -= 120
+    if candidate.side_white_min < 0.45:
+        score -= 70
+
     if candidate.source == "product.images":
         score += 80
         
@@ -273,6 +315,22 @@ def score_candidate(candidate: Candidate, product_id: str) -> None:
     candidate.score = round(score, 3)
 
 
+def review_reason(candidate: Candidate) -> str:
+    reasons: list[str] = []
+    stem = Path(candidate.name).stem.lower()
+    if candidate.bottom_band_ratio > 0.28 and candidate.bottom_band_span > 0.72:
+        reasons.append("底部疑似有橫向色塊或文案條")
+    if candidate.side_white_min < 0.45:
+        reasons.append("圖片邊界不是穩定白底")
+    if candidate.edge_white_ratio < 0.68:
+        reasons.append("四周白底比例偏低")
+    if candidate.compoundedness_score < 0.62:
+        reasons.append("疑似有商品以外的文字或多個區塊")
+    if re.search(r"[_-](0?1|10)$", stem):
+        reasons.append("檔名像主視覺/文案圖")
+    return "；".join(reasons)
+
+
 def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Candidate | None, str, str]:
     if not candidates:
         return None, "failed", "找不到 product.images 或商品內容圖片"
@@ -280,7 +338,14 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
         score_candidate(candidate, product_id)
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
     best = ranked[0]
-    return best, "success", "自動挑選 (已關閉人工審核)"
+    reason = review_reason(best)
+    runner_up = ranked[1] if len(ranked) > 1 else None
+    if runner_up and best.score - runner_up.score < 10:
+        reason = "前兩名候選圖分數接近" if not reason else f"{reason}；前兩名候選圖分數接近"
+    if reason:
+        best.reject_reason = reason
+        return best, "needs_review", reason
+    return best, "success", "自動挑選"
 
 
 def remove_background(input_path: Path) -> Image.Image:
@@ -318,6 +383,7 @@ def remove_background(input_path: Path) -> Image.Image:
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
+    img = img.convert("RGBA")
     arr = np.array(img)
     alpha = arr[:, :, 3]
     
@@ -330,11 +396,13 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
         xmin, xmax = np.where(cols)[0][[0, -1]]
         img = img.crop((xmin, ymin, xmax + 1, ymax + 1))
 
-    new_width = img.width + padding * 2
-    new_height = img.height + padding * 2
+    max_side = size - padding * 2
+    img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
 
-    canvas = Image.new("RGBA", (new_width, new_height), (255, 255, 255, 0))
-    canvas.alpha_composite(img, (padding, padding))
+    canvas = Image.new("RGBA", (size, size), (255, 255, 255, 0))
+    left = (size - img.width) // 2
+    top = (size - img.height) // 2
+    canvas.alpha_composite(img, (left, top))
     
     return canvas
 
@@ -349,9 +417,35 @@ def save_review_candidates(candidates: Iterable[Candidate], review_dir: Path) ->
     score_path = review_dir / "scores.csv"
     with score_path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["url", "name", "source", "score", "white_ratio", "edge_white_ratio", "center_content_ratio"])
+        writer.writerow([
+            "url",
+            "name",
+            "source",
+            "score",
+            "white_ratio",
+            "edge_white_ratio",
+            "center_content_ratio",
+            "compoundedness_score",
+            "bottom_band_ratio",
+            "bottom_band_span",
+            "side_white_min",
+            "review_reason",
+        ])
         for c in sorted(candidates, key=lambda item: item.score, reverse=True):
-            writer.writerow([c.url, c.name, c.source, c.score, c.white_ratio, c.edge_white_ratio, c.center_content_ratio])
+            writer.writerow([
+                c.url,
+                c.name,
+                c.source,
+                c.score,
+                c.white_ratio,
+                c.edge_white_ratio,
+                c.center_content_ratio,
+                c.compoundedness_score,
+                c.bottom_band_ratio,
+                c.bottom_band_span,
+                c.side_white_min,
+                review_reason(c),
+            ])
 
 
 def process_product(session: requests.Session, product_id: str, args: argparse.Namespace) -> dict[str, str]:
@@ -378,7 +472,7 @@ def process_product(session: requests.Session, product_id: str, args: argparse.N
         save_review_candidates(downloaded_candidates, args.output_dir / "review" / product_id)
 
     final_path = ""
-    if best and best.path:
+    if status == "success" and best and best.path:
         removed = remove_background(best.path)
         final = fit_to_canvas(removed, size=args.size, padding=args.padding)
         args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
@@ -393,6 +487,7 @@ def process_product(session: requests.Session, product_id: str, args: argparse.N
         "selected_name": best.name if best else "",
         "selected_score": str(best.score) if best else "",
         "confidence_note": note,
+        "reject_reason": best.reject_reason if best else note,
         "final_path": final_path,
         "candidate_count": str(len(downloaded_candidates)),
     }
@@ -407,6 +502,7 @@ def write_report(rows: list[dict[str, str]], report_path: Path) -> None:
         "selected_name",
         "selected_score",
         "confidence_note",
+        "reject_reason",
         "final_path",
         "candidate_count",
         "error",

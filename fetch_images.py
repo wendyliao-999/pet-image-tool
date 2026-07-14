@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -37,6 +38,8 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
+MAX_REMBG_INPUT_SIDE = 1800
+_rembg_session = None
 
 
 @dataclass
@@ -177,6 +180,23 @@ def download_candidate(
     path.write_bytes(response.content)
     candidate.path = path
     return path
+
+
+def get_rembg_session():
+    global _rembg_session
+    if new_session is None:
+        raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
+    if _rembg_session is None:
+        _rembg_session = new_session("u2net")
+    return _rembg_session
+
+
+def load_background_input(input_path: Path) -> Image.Image:
+    with Image.open(input_path) as img:
+        rgba = img.convert("RGBA")
+    if max(rgba.size) > MAX_REMBG_INPUT_SIDE:
+        rgba.thumbnail((MAX_REMBG_INPUT_SIDE, MAX_REMBG_INPUT_SIDE), Image.Resampling.LANCZOS)
+    return rgba
 
 
 def ratio_white(img: Image.Image, threshold: int = 245) -> float:
@@ -352,20 +372,18 @@ def remove_background(input_path: Path) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
     
-    session = new_session("u2net")
-    
-    with Image.open(input_path) as img:
-        original_rgba = img.convert("RGBA")
+    session = get_rembg_session()
+    original_rgba = load_background_input(input_path)
         
-        quiet_output = io.StringIO()
-        with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
-            # 取得純黑白遮罩
-            mask = remove(
-                original_rgba,
-                session=session,
-                only_mask=True,
-                post_process_mask=True
-            )
+    quiet_output = io.StringIO()
+    with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
+        # 取得純黑白遮罩
+        mask = remove(
+            original_rgba,
+            session=session,
+            only_mask=True,
+            post_process_mask=True
+        )
             
     mask = mask.convert("L")
     
@@ -380,6 +398,65 @@ def remove_background(input_path: Path) -> Image.Image:
     original_rgba.putalpha(smoothed_mask)
     
     return original_rgba
+
+
+def remove_white_background_from_edges(
+    input_path: Path,
+    white_threshold: int = 246,
+    tolerance: int = 14,
+    soften_radius: float = 0.6,
+) -> Image.Image:
+    with Image.open(input_path) as img:
+        rgba = img.convert("RGBA")
+
+    arr = np.array(rgba)
+    rgb = arr[:, :, :3].astype(np.int16)
+    h, w = rgb.shape[:2]
+
+    near_white = np.all(rgb >= white_threshold, axis=2)
+    soft_white = (
+        np.min(rgb, axis=2) >= white_threshold - tolerance
+    ) & (
+        np.max(rgb, axis=2) - np.min(rgb, axis=2) <= tolerance * 2
+    )
+    background_like = near_white | soft_white
+
+    visited = np.zeros((h, w), dtype=bool)
+    queue: list[tuple[int, int]] = []
+
+    for x in range(w):
+        if background_like[0, x]:
+            visited[0, x] = True
+            queue.append((0, x))
+        if background_like[h - 1, x]:
+            visited[h - 1, x] = True
+            queue.append((h - 1, x))
+    for y in range(h):
+        if background_like[y, 0]:
+            visited[y, 0] = True
+            queue.append((y, 0))
+        if background_like[y, w - 1]:
+            visited[y, w - 1] = True
+            queue.append((y, w - 1))
+
+    head = 0
+    while head < len(queue):
+        y, x = queue[head]
+        head += 1
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and background_like[ny, nx]:
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+
+    alpha = np.full((h, w), 255, dtype=np.uint8)
+    alpha[visited] = 0
+    alpha_img = Image.fromarray(alpha, mode="L")
+    if soften_radius > 0:
+        alpha_img = alpha_img.filter(ImageFilter.GaussianBlur(radius=soften_radius))
+
+    result = rgba.copy()
+    result.putalpha(alpha_img)
+    return result
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
@@ -514,6 +591,17 @@ def write_report(rows: list[dict[str, str]], report_path: Path) -> None:
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
+def write_error_log(product_id: str, exc: Exception, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "error_log.txt"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"[{timestamp}] product_id={product_id}\n")
+        fh.write(f"{type(exc).__name__}: {exc}\n")
+        fh.write(traceback.format_exc())
+        fh.write("\n---\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抓取 petpetgo 商品圖、去背並輸出 800x800 PNG。")
     parser.add_argument("input", help="CSV 檔案路徑，或 Google Sheets 發布後的 CSV URL")
@@ -546,6 +634,7 @@ def main() -> int:
         try:
             row = process_product(session, product_id, args)
         except Exception as exc:
+            write_error_log(product_id, exc, args.output_dir)
             row = {
                 "product_id": product_id,
                 "status": "failed",

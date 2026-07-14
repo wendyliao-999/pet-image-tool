@@ -3,9 +3,12 @@ import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
 import re
+import shutil
 import tempfile
+import traceback
 import zipfile
 import io
+from datetime import datetime
 
 # 載入原本寫好的工具包
 import fetch_images as fi
@@ -27,6 +30,29 @@ def refresh_successful_files():
         for r in st.session_state.result_rows
         if r.get("final_path") and Path(r["final_path"]).exists()
     ]
+
+
+def prepare_output_dir(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("final", "original", "review"):
+        path = output_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+    for name in ("report.csv", "error_log.txt"):
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def log_error(product_id: str, exc: Exception, args) -> None:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = args.output_dir / "error_log.txt"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"[{timestamp}] product_id={product_id}\n")
+        fh.write(f"{type(exc).__name__}: {exc}\n")
+        fh.write(traceback.format_exc())
+        fh.write("\n---\n")
 
 # --- 2. 左側邊欄設定區 ---
 st.sidebar.header("⚙️ 進階設定")
@@ -74,7 +100,7 @@ def process_petpark(product_id, args):
         temp_path = Path(temp_dir) / f"{product_id}.jpg"
         temp_path.write_bytes(img_resp.content)
         
-        removed = fi.remove_background(temp_path)
+        removed = fi.remove_white_background_from_edges(temp_path)
         final = fi.fit_to_canvas(removed, size=args.size, padding=args.padding)
     
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
@@ -98,7 +124,7 @@ input_text = st.text_area(
 )
 
 # --- 4. 執行邏輯 ---
-if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
+if st.button(f"🚀 開始執行抓取任務", width="stretch"):
     # 每次按鈕按下，先清除舊的記憶
     st.session_state.task_completed = False
     st.session_state.successful_files = []
@@ -107,6 +133,7 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
         st.warning("請先輸入商品 ID 喔！")
     else:
         args = UIArgs()
+        prepare_output_dir(args.output_dir)
         product_ids = list(dict.fromkeys(re.findall(r"[A-Za-z0-9]+", input_text)))
         
         if not product_ids:
@@ -142,6 +169,7 @@ if st.button(f"🚀 開始執行抓取任務", use_container_width=True):
                     elif row.get("status") == "needs_review":
                         st.warning(f"⚠️ ID {pid} 需要人工確認：{row.get('reject_reason') or row.get('confidence_note')}")
                 except Exception as exc:
+                    log_error(pid, exc, args)
                     row = {"product_id": pid, "status": "failed", "error": str(exc)}
                     st.error(f"❌ ID {pid} 處理失敗: {exc}")
                     
@@ -162,7 +190,7 @@ if st.session_state.task_completed:
     st.markdown("### 📋 處理結果")
     
     # 顯示報表
-    st.dataframe(st.session_state.result_rows, use_container_width=True)
+    st.dataframe(st.session_state.result_rows, width="stretch")
 
     review_rows = [r for r in st.session_state.result_rows if r.get("status") == "needs_review"]
     if review_rows:
@@ -189,7 +217,7 @@ if st.session_state.task_completed:
             for idx, image_path in enumerate(candidate_paths[:8]):
                 col = cols[idx % len(cols)]
                 with col:
-                    st.image(str(image_path), caption=image_path.name, use_container_width=True)
+                    st.image(str(image_path), caption=image_path.name, width="stretch")
                     if st.button("使用這張", key=f"use_{product_id}_{idx}_{image_path.name}"):
                         try:
                             final_file = make_final_from_review_choice(product_id, image_path, args)
@@ -205,6 +233,7 @@ if st.session_state.task_completed:
                             st.success(f"已使用 {image_path.name} 產生去背圖")
                             st.rerun()
                         except Exception as exc:
+                            log_error(product_id, exc, args)
                             st.error(f"去背失敗：{exc}")
 
     if st.session_state.successful_files:
@@ -221,7 +250,7 @@ if st.session_state.task_completed:
             data=zip_buffer.getvalue(),
             file_name="pet_images_output.zip",
             mime="application/zip",
-            use_container_width=True
+            width="stretch"
         )
     else:
         st.info("目前還沒有可下載的完成圖片。")

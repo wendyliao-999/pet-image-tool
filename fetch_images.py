@@ -460,18 +460,7 @@ def remove_white_background_from_edges(
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
-    img = img.convert("RGBA")
-    arr = np.array(img)
-    alpha = arr[:, :, 3]
-    
-    # 調整判定閾值，只對有實體顏色的區域進行裁切
-    rows = np.any(alpha > 50, axis=1)
-    cols = np.any(alpha > 50, axis=0)
-    
-    if rows.any() and cols.any():
-        ymin, ymax = np.where(rows)[0][[0, -1]]
-        xmin, xmax = np.where(cols)[0][[0, -1]]
-        img = img.crop((xmin, ymin, xmax + 1, ymax + 1))
+    img = crop_to_content(img)
 
     max_side = size - padding * 2
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
@@ -482,6 +471,40 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
     canvas.alpha_composite(img, (left, top))
     
     return canvas
+
+
+def crop_to_content(img: Image.Image, padding: int = 0) -> Image.Image:
+    img = img.convert("RGBA")
+    arr = np.array(img)
+    alpha = arr[:, :, 3]
+
+    rows = np.any(alpha > 50, axis=1)
+    cols = np.any(alpha > 50, axis=0)
+
+    if not rows.any() or not cols.any():
+        return img
+
+    ymin, ymax = np.where(rows)[0][[0, -1]]
+    xmin, xmax = np.where(cols)[0][[0, -1]]
+    xmin = max(0, xmin - padding)
+    ymin = max(0, ymin - padding)
+    xmax = min(img.width - 1, xmax + padding)
+    ymax = min(img.height - 1, ymax + padding)
+    return img.crop((xmin, ymin, xmax + 1, ymax + 1))
+
+
+def fit_to_product_bounds(img: Image.Image, size: int = 800, padding: int = 12) -> Image.Image:
+    img = crop_to_content(img)
+    if max(img.size) > size:
+        img.thumbnail((size, size), Image.Resampling.LANCZOS)
+    return crop_to_content(img, padding=padding)
+
+
+def make_output_image(img: Image.Image, args: argparse.Namespace) -> Image.Image:
+    output_mode = getattr(args, "output_mode", "square")
+    if output_mode == "product":
+        return fit_to_product_bounds(img, size=args.size, padding=args.padding)
+    return fit_to_canvas(img, size=args.size, padding=args.padding)
 
 
 def save_review_candidates(candidates: Iterable[Candidate], review_dir: Path) -> None:
@@ -551,7 +574,7 @@ def process_product(session: requests.Session, product_id: str, args: argparse.N
     final_path = ""
     if status == "success" and best and best.path:
         removed = remove_background(best.path)
-        final = fit_to_canvas(removed, size=args.size, padding=args.padding)
+        final = make_output_image(removed, args)
         args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
         final_file = args.output_dir / "final" / f"{product_id}.png"
         final.save(final_file)

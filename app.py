@@ -56,6 +56,11 @@ def log_error(product_id: str, exc: Exception, args) -> None:
 
 # --- 2. 左側邊欄設定區 ---
 st.sidebar.header("⚙️ 進階設定")
+output_mode_label = st.sidebar.radio(
+    "輸出模式",
+    ["貼齊商品尺寸（適合 Illustrator）", "800x800 正方形透明畫布"],
+    index=0,
+)
 size = st.sidebar.number_input("輸出圖片大小 (px)", min_value=100, max_value=2000, value=800)
 padding = st.sidebar.number_input("邊界留白 (px)", min_value=0, max_value=200, value=24)
 
@@ -65,12 +70,13 @@ class UIArgs:
         self.report = Path("output/report.csv")
         self.size = size
         self.padding = padding
+        self.output_mode = "product" if output_mode_label.startswith("貼齊") else "square"
         self.keep_original = False
 
 
 def make_final_from_review_choice(product_id, image_path, args):
     removed = fi.remove_background(image_path)
-    final = fi.fit_to_canvas(removed, size=args.size, padding=args.padding)
+    final = fi.make_output_image(removed, args)
 
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
     final_file = args.output_dir / "final" / f"{product_id}.png"
@@ -101,7 +107,7 @@ def process_petpark(product_id, args):
         temp_path.write_bytes(img_resp.content)
         
         removed = fi.remove_white_background_from_edges(temp_path)
-        final = fi.fit_to_canvas(removed, size=args.size, padding=args.padding)
+        final = fi.make_output_image(removed, args)
     
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
     final_file = args.output_dir / "final" / f"{product_id}.png"

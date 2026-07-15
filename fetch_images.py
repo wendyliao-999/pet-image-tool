@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import traceback
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -369,11 +370,14 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
 
 
 def remove_background(input_path: Path) -> Image.Image:
+    original_rgba = load_background_input(input_path)
+    if should_use_edge_white_removal(original_rgba):
+        return remove_white_background_from_edges(input_path)
+
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
-    
+
     session = get_rembg_session()
-    original_rgba = load_background_input(input_path)
     source_rgba = original_rgba.copy()
         
     quiet_output = io.StringIO()
@@ -402,6 +406,13 @@ def remove_background(input_path: Path) -> Image.Image:
         return remove_white_background_from_edges(input_path)
     
     return original_rgba
+
+
+def should_use_edge_white_removal(source_rgba: Image.Image) -> bool:
+    edge_ratio = edge_white_ratio(source_rgba)
+    side_min = min(side_white_ratios(source_rgba).values())
+    white_ratio = ratio_white(source_rgba)
+    return edge_ratio >= 0.72 and side_min >= 0.55 and white_ratio >= 0.18
 
 
 def colored_content_loss_ratio(source_rgba: Image.Image, removed_rgba: Image.Image) -> float:
@@ -436,8 +447,7 @@ def remove_white_background_from_edges(
     tolerance: int = 14,
     soften_radius: float = 0.6,
 ) -> Image.Image:
-    with Image.open(input_path) as img:
-        rgba = img.convert("RGBA")
+    rgba = load_background_input(input_path)
 
     arr = np.array(rgba)
     rgb = arr[:, :, :3].astype(np.int16)
@@ -706,6 +716,8 @@ def main() -> int:
                 "status": "failed",
                 "error": str(exc),
             }
+        finally:
+            gc.collect()
         rows.append(row)
         write_report(rows, args.report)
         if index < len(product_ids):

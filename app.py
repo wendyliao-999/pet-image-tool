@@ -8,10 +8,13 @@ import tempfile
 import traceback
 import zipfile
 import io
+import gc
 from datetime import datetime
 
 # 載入原本寫好的工具包
 import fetch_images as fi
+
+MAX_BATCH_IDS = 12
 
 # --- 1. 網頁標題與外觀設定 ---
 st.set_page_config(page_title="雙平台圖片抓取神器", page_icon="📦", layout="wide")
@@ -58,6 +61,7 @@ def log_error(product_id: str, exc: Exception, args) -> None:
 st.sidebar.header("⚙️ 進階設定")
 size = st.sidebar.number_input("商品最大邊長 (px)", min_value=100, max_value=2000, value=800)
 padding = st.sidebar.number_input("商品邊界留白 (px)", min_value=0, max_value=120, value=8)
+st.sidebar.caption(f"多人共用時建議每批最多 {MAX_BATCH_IDS} 筆，處理完再跑下一批。")
 
 class UIArgs:
     def __init__(self):
@@ -139,8 +143,8 @@ if st.button(f"🚀 開始執行抓取任務", width="stretch"):
         
         if not product_ids:
             st.error("找不到有效的商品 ID...")
-        elif len(product_ids) > 20:
-            st.error(f"⚠️ 為了避免雲端主機當機或被網站封鎖，每次最多只能處理 20 筆 ID 喔！（您目前輸入了 {len(product_ids)} 筆，請分批執行）")
+        elif len(product_ids) > MAX_BATCH_IDS:
+            st.error(f"⚠️ 為了避免雲端主機當機或被網站封鎖，每次最多只能處理 {MAX_BATCH_IDS} 筆 ID 喔！（您目前輸入了 {len(product_ids)} 筆，請分批執行）")
         else:
             st.success(f"✅ 成功載入 {len(product_ids)} 筆【{platform}】的任務！準備開工...")
             progress_bar = st.progress(0)
@@ -173,6 +177,8 @@ if st.button(f"🚀 開始執行抓取任務", width="stretch"):
                     log_error(pid, exc, args)
                     row = {"product_id": pid, "status": "failed", "error": str(exc)}
                     st.error(f"❌ ID {pid} 處理失敗: {exc}")
+                finally:
+                    gc.collect()
                     
                 rows.append(row)
                 progress_bar.progress(index / len(product_ids))

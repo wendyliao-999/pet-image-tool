@@ -374,6 +374,7 @@ def remove_background(input_path: Path) -> Image.Image:
     
     session = get_rembg_session()
     original_rgba = load_background_input(input_path)
+    source_rgba = original_rgba.copy()
         
     quiet_output = io.StringIO()
     with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
@@ -396,8 +397,37 @@ def remove_background(input_path: Path) -> Image.Image:
     
     # 將這張完美乾淨的遮罩放回原圖上
     original_rgba.putalpha(smoothed_mask)
+
+    if should_use_edge_white_fallback(source_rgba, original_rgba):
+        return remove_white_background_from_edges(input_path)
     
     return original_rgba
+
+
+def colored_content_loss_ratio(source_rgba: Image.Image, removed_rgba: Image.Image) -> float:
+    source = np.array(source_rgba.convert("RGBA"))
+    removed_alpha = np.array(removed_rgba.convert("RGBA"))[:, :, 3]
+    source_alpha = source[:, :, 3]
+    rgb = source[:, :, :3].astype(np.int16)
+
+    channel_range = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+    brightness = np.mean(rgb, axis=2)
+    saturated_content = (channel_range > 18) & np.any(rgb < 248, axis=2)
+    neutral_content = brightness < 225
+    source_content = (source_alpha > 200) & (saturated_content | neutral_content)
+
+    content_pixels = int(np.sum(source_content))
+    if content_pixels < 500:
+        return 0.0
+
+    lost_pixels = int(np.sum(source_content & (removed_alpha < 48)))
+    return lost_pixels / content_pixels
+
+
+def should_use_edge_white_fallback(source_rgba: Image.Image, removed_rgba: Image.Image) -> bool:
+    if edge_white_ratio(source_rgba) < 0.55:
+        return False
+    return colored_content_loss_ratio(source_rgba, removed_rgba) > 0.08
 
 
 def remove_white_background_from_edges(

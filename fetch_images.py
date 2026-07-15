@@ -460,7 +460,7 @@ def remove_white_background_from_edges(
 
 
 def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image.Image:
-    img = crop_to_content(img)
+    img = crop_to_content(img, alpha_threshold=80)
 
     max_side = size - padding * 2
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
@@ -473,13 +473,13 @@ def fit_to_canvas(img: Image.Image, size: int = 800, padding: int = 24) -> Image
     return canvas
 
 
-def crop_to_content(img: Image.Image, padding: int = 0) -> Image.Image:
+def crop_to_content(img: Image.Image, padding: int = 0, alpha_threshold: int = 80) -> Image.Image:
     img = img.convert("RGBA")
     arr = np.array(img)
     alpha = arr[:, :, 3]
 
-    rows = np.any(alpha > 50, axis=1)
-    cols = np.any(alpha > 50, axis=0)
+    rows = np.any(alpha >= alpha_threshold, axis=1)
+    cols = np.any(alpha >= alpha_threshold, axis=0)
 
     if not rows.any() or not cols.any():
         return img
@@ -493,11 +493,24 @@ def crop_to_content(img: Image.Image, padding: int = 0) -> Image.Image:
     return img.crop((xmin, ymin, xmax + 1, ymax + 1))
 
 
+def add_transparent_padding(img: Image.Image, padding: int = 0) -> Image.Image:
+    img = img.convert("RGBA")
+    if padding <= 0:
+        return img
+    canvas = Image.new("RGBA", (img.width + padding * 2, img.height + padding * 2), (255, 255, 255, 0))
+    canvas.alpha_composite(img, (padding, padding))
+    return canvas
+
+
 def fit_to_product_bounds(img: Image.Image, size: int = 800, padding: int = 12) -> Image.Image:
-    img = crop_to_content(img)
+    img = crop_to_content(img, alpha_threshold=96)
+    arr = np.array(img)
+    arr[:, :, 3] = np.where(arr[:, :, 3] < 16, 0, arr[:, :, 3])
+    img = Image.fromarray(arr, mode="RGBA")
     if max(img.size) > size:
         img.thumbnail((size, size), Image.Resampling.LANCZOS)
-    return crop_to_content(img, padding=padding)
+    img = crop_to_content(img, alpha_threshold=32)
+    return add_transparent_padding(img, padding=padding)
 
 
 def make_output_image(img: Image.Image, args: argparse.Namespace) -> Image.Image:

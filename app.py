@@ -56,13 +56,8 @@ def log_error(product_id: str, exc: Exception, args) -> None:
 
 # --- 2. 左側邊欄設定區 ---
 st.sidebar.header("⚙️ 進階設定")
-output_mode_label = st.sidebar.radio(
-    "輸出模式",
-    ["貼齊商品尺寸（適合 Illustrator）", "800x800 正方形透明畫布"],
-    index=0,
-)
-size = st.sidebar.number_input("輸出圖片大小 (px)", min_value=100, max_value=2000, value=800)
-padding = st.sidebar.number_input("邊界留白 (px)", min_value=0, max_value=200, value=24)
+size = st.sidebar.number_input("商品最大邊長 (px)", min_value=100, max_value=2000, value=800)
+padding = st.sidebar.number_input("商品邊界留白 (px)", min_value=0, max_value=120, value=8)
 
 class UIArgs:
     def __init__(self):
@@ -70,7 +65,7 @@ class UIArgs:
         self.report = Path("output/report.csv")
         self.size = size
         self.padding = padding
-        self.output_mode = "product" if output_mode_label.startswith("貼齊") else "square"
+        self.output_mode = "product"
         self.keep_original = False
 
 

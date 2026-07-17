@@ -369,6 +369,31 @@ def choose_candidate(candidates: list[Candidate], product_id: str) -> tuple[Cand
     return best, "success", "自動挑選"
 
 
+def choose_petpetgo_candidates(
+    session: requests.Session,
+    product_id: str,
+    primary_candidates: list[Candidate],
+    detail_candidates: list[Candidate],
+    working_dir: Path,
+) -> tuple[Candidate | None, str, str, list[Candidate]]:
+    if primary_candidates:
+        for index, candidate in enumerate(primary_candidates, 1):
+            download_candidate(session, candidate, product_id, index, working_dir)
+        best, status, note = choose_candidate(primary_candidates, product_id)
+        return best, status, note, list(primary_candidates)
+
+    for index, candidate in enumerate(detail_candidates, 1):
+        download_candidate(session, candidate, product_id, index, working_dir)
+    best, status, note = choose_candidate(detail_candidates, product_id)
+    if status == "success":
+        note = "找不到上方商品圖，使用商品介紹圖備援"
+    elif note:
+        note = f"找不到上方商品圖，使用商品介紹圖備援；{note}"
+    else:
+        note = "找不到上方商品圖，使用商品介紹圖備援"
+    return best, status, note, list(detail_candidates)
+
+
 def remove_background(input_path: Path) -> Image.Image:
     original_rgba = load_background_input(input_path)
     if should_use_edge_white_removal(original_rgba):
@@ -609,17 +634,13 @@ def process_product(session: requests.Session, product_id: str, args: argparse.N
     temp_context = tempfile.TemporaryDirectory(prefix=f"petpetgo_{product_id}_")
     working_dir = args.output_dir / "original" / product_id if args.keep_original else Path(temp_context.name)
 
-    for index, candidate in enumerate(primary_candidates, 1):
-        download_candidate(session, candidate, product_id, index, working_dir)
-
-    best, status, note = choose_candidate(primary_candidates, product_id)
-    downloaded_candidates = list(primary_candidates)
-    if status != "success" and detail_candidates:
-        start_index = len(primary_candidates) + 1
-        for index, candidate in enumerate(detail_candidates, start_index):
-            download_candidate(session, candidate, product_id, index, working_dir)
-        downloaded_candidates.extend(detail_candidates)
-        best, status, note = choose_candidate(downloaded_candidates, product_id)
+    best, status, note, downloaded_candidates = choose_petpetgo_candidates(
+        session,
+        product_id,
+        primary_candidates,
+        detail_candidates,
+        working_dir,
+    )
 
     if status != "success":
         save_review_candidates(downloaded_candidates, args.output_dir / "review" / product_id)

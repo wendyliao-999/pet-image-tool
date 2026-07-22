@@ -397,7 +397,17 @@ def choose_petpetgo_candidates(
 def remove_background(input_path: Path) -> Image.Image:
     original_rgba = load_background_input(input_path)
     if should_use_edge_white_removal(original_rgba):
-        return remove_white_background_from_edges(input_path)
+        edge_removed = remove_white_background_from_edges(input_path)
+        if not should_use_rembg_for_white_package(original_rgba, edge_removed):
+            return remove_internal_white_cutouts(edge_removed)
+        if should_use_conservative_edge_for_wide_package(edge_removed):
+            conservative_removed = remove_white_background_from_edges(
+                input_path,
+                white_threshold=252,
+                tolerance=4,
+                soften_radius=0.4,
+            )
+            return remove_internal_white_cutouts(conservative_removed)
 
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
@@ -438,6 +448,106 @@ def should_use_edge_white_removal(source_rgba: Image.Image) -> bool:
     side_min = min(side_white_ratios(source_rgba).values())
     white_ratio = ratio_white(source_rgba)
     return edge_ratio >= 0.72 and side_min >= 0.55 and white_ratio >= 0.18
+
+
+def transparent_hole_ratio(img: Image.Image, alpha_threshold: int = 32) -> float:
+    rgba = img.convert("RGBA")
+    bbox = rgba.getbbox()
+    if not bbox:
+        return 1.0
+    alpha = np.array(rgba)[:, :, 3]
+    crop = alpha[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+    if crop.size == 0:
+        return 1.0
+    return float(np.mean(crop < alpha_threshold))
+
+
+def should_use_rembg_for_white_package(source_rgba: Image.Image, edge_removed_rgba: Image.Image) -> bool:
+    edge_ratio = edge_white_ratio(source_rgba)
+    side_min = min(side_white_ratios(source_rgba).values())
+    white_ratio = ratio_white(source_rgba)
+    if edge_ratio < 0.9 or side_min < 0.9 or white_ratio < 0.45:
+        return False
+
+    return transparent_hole_ratio(edge_removed_rgba) >= 0.15
+
+
+def should_use_conservative_edge_for_wide_package(edge_removed_rgba: Image.Image) -> bool:
+    bbox = edge_removed_rgba.convert("RGBA").getbbox()
+    if not bbox:
+        return False
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    if height <= 0:
+        return False
+    return width / height >= 1.15
+
+
+def remove_internal_white_cutouts(img: Image.Image) -> Image.Image:
+    rgba = img.convert("RGBA")
+    bbox = rgba.getbbox()
+    if not bbox:
+        return rgba
+
+    try:
+        from scipy import ndimage
+    except Exception:
+        return rgba
+
+    arr = np.array(rgba)
+    x0, y0, x1, y1 = bbox
+    crop = arr[y0:y1, x0:x1]
+    crop_alpha = crop[:, :, 3]
+    rgb = crop[:, :, :3].astype(np.int16)
+    near_white = (
+        np.min(rgb, axis=2) >= 238
+    ) & (
+        np.max(rgb, axis=2) - np.min(rgb, axis=2) <= 28
+    ) & (
+        crop_alpha > 180
+    )
+
+    labels, count = ndimage.label(near_white)
+    if count == 0:
+        return rgba
+
+    hole_mask = np.zeros_like(near_white, dtype=bool)
+    box_area = near_white.size
+    for label in range(1, count + 1):
+        component = labels == label
+        ys, xs = np.where(component)
+        if ys.size == 0:
+            continue
+        touches_box = (
+            ys.min() == 0
+            or xs.min() == 0
+            or ys.max() == near_white.shape[0] - 1
+            or xs.max() == near_white.shape[1] - 1
+        )
+        if touches_box:
+            continue
+
+        area_ratio = ys.size / box_area
+        height = ys.max() - ys.min() + 1
+        width = xs.max() - xs.min() + 1
+        aspect = width / max(height, 1)
+        center_y = (ys.min() + ys.max()) / 2 / near_white.shape[0]
+
+        if 0.004 <= area_ratio <= 0.08 and aspect >= 1.6 and center_y <= 0.45:
+            hole_mask |= component
+
+    if not hole_mask.any():
+        return rgba
+
+    local_alpha = crop_alpha.copy()
+    local_alpha[hole_mask] = 0
+    softened = Image.fromarray(np.where(hole_mask, 0, 255).astype(np.uint8), "L")
+    softened = softened.filter(ImageFilter.GaussianBlur(radius=0.7))
+    softened_arr = np.array(softened)
+    dilated = ndimage.binary_dilation(hole_mask, iterations=2)
+    local_alpha[dilated] = np.minimum(local_alpha[dilated], softened_arr[dilated])
+    arr[y0:y1, x0:x1, 3] = local_alpha
+    return Image.fromarray(arr, "RGBA")
 
 
 def colored_content_loss_ratio(source_rgba: Image.Image, removed_rgba: Image.Image) -> float:

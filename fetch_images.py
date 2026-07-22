@@ -394,9 +394,9 @@ def choose_petpetgo_candidates(
     return best, status, note, list(detail_candidates)
 
 
-def remove_background(input_path: Path) -> Image.Image:
+def remove_background(input_path: Path, background_mode: str = "quality") -> Image.Image:
     original_rgba = load_background_input(input_path)
-    if should_use_edge_white_removal(original_rgba):
+    if background_mode == "fast" and should_use_edge_white_removal(original_rgba):
         edge_removed = remove_white_background_from_edges(input_path)
         if not should_use_rembg_for_white_package(original_rgba, edge_removed):
             return remove_internal_white_cutouts(edge_removed)
@@ -409,38 +409,30 @@ def remove_background(input_path: Path) -> Image.Image:
             )
             return remove_internal_white_cutouts(conservative_removed)
 
+    return remove_background_with_rembg(original_rgba)
+
+
+def remove_background_with_rembg(original_rgba: Image.Image) -> Image.Image:
     if remove is None:
         raise RuntimeError("找不到 rembg，請先安裝：python3 -m pip install rembg onnxruntime")
 
     session = get_rembg_session()
-    source_rgba = original_rgba.copy()
-        
     quiet_output = io.StringIO()
     with contextlib.redirect_stdout(quiet_output), contextlib.redirect_stderr(quiet_output):
-        # 取得純黑白遮罩
         mask = remove(
             original_rgba,
             session=session,
             only_mask=True,
             post_process_mask=True
         )
-            
-    mask = mask.convert("L")
-    
-    # 🌟【超級關鍵：消除原圖白底帶來的白邊】🌟
-    # 先使用 MinFilter(3) 讓白色遮罩向內收縮（侵蝕）約 1 像素，把原圖邊緣的白底像素徹底切除
-    eroded_mask = mask.filter(ImageFilter.MinFilter(3))
-    
-    # 收縮完後，再做非常輕微的模糊，保證邊緣滑順、不生硬、不鋸齒
-    smoothed_mask = eroded_mask.filter(ImageFilter.GaussianBlur(radius=0.6))
-    
-    # 將這張完美乾淨的遮罩放回原圖上
-    original_rgba.putalpha(smoothed_mask)
 
-    if should_use_edge_white_fallback(source_rgba, original_rgba):
-        return remove_white_background_from_edges(input_path)
-    
-    return original_rgba
+    mask = mask.convert("L")
+    eroded_mask = mask.filter(ImageFilter.MinFilter(3))
+    smoothed_mask = eroded_mask.filter(ImageFilter.GaussianBlur(radius=0.6))
+
+    result = original_rgba.copy()
+    result.putalpha(smoothed_mask)
+    return result
 
 
 def should_use_edge_white_removal(source_rgba: Image.Image) -> bool:
@@ -757,7 +749,7 @@ def process_product(session: requests.Session, product_id: str, args: argparse.N
 
     final_path = ""
     if status == "success" and best and best.path:
-        removed = remove_background(best.path)
+        removed = remove_background(best.path, getattr(args, "background_mode", "quality"))
         final = make_output_image(removed, args)
         args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
         final_file = args.output_dir / "final" / f"{product_id}.png"
@@ -820,6 +812,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-delay", type=float, default=DEFAULT_DELAY[0], help="每個商品處理後最短等待秒數")
     parser.add_argument("--max-delay", type=float, default=DEFAULT_DELAY[1], help="每個商品處理後最長等待秒數")
     parser.add_argument("--limit", type=int, default=0, help="測試用，只處理前 N 筆；0 表示全部")
+    parser.add_argument(
+        "--background-mode",
+        choices=("quality", "fast"),
+        default="quality",
+        help="去背模式：quality 使用 rembg 品質優先；fast 使用快速白底模式",
+    )
     return parser.parse_args()
 
 

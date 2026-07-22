@@ -59,6 +59,12 @@ def log_error(product_id: str, exc: Exception, args) -> None:
 
 # --- 2. 左側邊欄設定區 ---
 st.sidebar.header("⚙️ 進階設定")
+background_mode_label = st.sidebar.radio(
+    "去背模式",
+    ["品質優先 rembg（建議）", "快速白底模式"],
+    horizontal=False,
+)
+background_mode = "fast" if background_mode_label == "快速白底模式" else "quality"
 size = st.sidebar.number_input("商品最大邊長 (px)", min_value=100, max_value=2000, value=800)
 padding = st.sidebar.number_input("商品邊界留白 (px)", min_value=0, max_value=120, value=8)
 st.sidebar.caption(f"多人共用時建議每批最多 {MAX_BATCH_IDS} 筆，處理完再跑下一批。")
@@ -70,11 +76,12 @@ class UIArgs:
         self.size = size
         self.padding = padding
         self.output_mode = "product"
+        self.background_mode = background_mode
         self.keep_original = False
 
 
 def make_final_from_review_choice(product_id, image_path, args):
-    removed = fi.remove_background(image_path)
+    removed = fi.remove_background(image_path, args.background_mode)
     final = fi.make_output_image(removed, args)
 
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
@@ -105,7 +112,7 @@ def process_petpark(product_id, args):
         temp_path = Path(temp_dir) / f"{product_id}.jpg"
         temp_path.write_bytes(img_resp.content)
         
-        removed = fi.remove_white_background_from_edges(temp_path)
+        removed = fi.remove_background(temp_path, args.background_mode)
         final = fi.make_output_image(removed, args)
     
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)

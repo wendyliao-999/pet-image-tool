@@ -533,7 +533,7 @@ def remove_internal_white_cutouts(img: Image.Image) -> Image.Image:
         aspect = width / max(height, 1)
         center_y = (ys.min() + ys.max()) / 2 / near_white.shape[0]
 
-        if 0.004 <= area_ratio <= 0.08 and aspect >= 1.6 and center_y <= 0.45:
+        if 0.004 <= area_ratio <= 0.08 and 1.6 <= aspect <= 6.0 and 0.06 <= center_y <= 0.45:
             hole_mask |= component
 
     if not hole_mask.any():

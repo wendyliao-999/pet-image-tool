@@ -80,8 +80,17 @@ class UIArgs:
         self.keep_original = False
 
 
+def remove_background_compat(image_path, args):
+    try:
+        return fi.remove_background(image_path, args.background_mode)
+    except TypeError as exc:
+        if "positional argument" not in str(exc):
+            raise
+        return fi.remove_background(image_path)
+
+
 def make_final_from_review_choice(product_id, image_path, args):
-    removed = fi.remove_background(image_path, args.background_mode)
+    removed = remove_background_compat(image_path, args)
     final = fi.make_output_image(removed, args)
 
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)
@@ -112,7 +121,7 @@ def process_petpark(product_id, args):
         temp_path = Path(temp_dir) / f"{product_id}.jpg"
         temp_path.write_bytes(img_resp.content)
         
-        removed = fi.remove_background(temp_path, args.background_mode)
+        removed = remove_background_compat(temp_path, args)
         final = fi.make_output_image(removed, args)
     
     args.output_dir.joinpath("final").mkdir(parents=True, exist_ok=True)

@@ -261,15 +261,29 @@ if st.session_state.task_completed:
 
     if st.session_state.successful_files:
         st.markdown("### 🎁 打包下載區")
+        available_files = [
+            file_path
+            for file_path in st.session_state.successful_files
+            if file_path and Path(file_path).exists()
+        ]
+        missing_count = len(st.session_state.successful_files) - len(available_files)
+
+        if missing_count:
+            st.session_state.successful_files = available_files
+            st.warning(f"有 {missing_count} 張完成圖已不存在，可能是雲端暫存檔被重置；請重新執行該批商品。")
+
+        if not available_files:
+            st.info("目前沒有可打包的完成圖片，請重新執行商品。")
+            st.stop()
     
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for file_path in st.session_state.successful_files:
+            for file_path in available_files:
                 zip_file.write(file_path, Path(file_path).name)
         
         # 我也順便幫你優化了按鈕文字，讓你可以看到總共包了幾張圖進去！
         st.download_button(
-            label=f"📦 一鍵下載 {len(st.session_state.successful_files)} 張去背圖片 (ZIP 壓縮檔)",
+            label=f"📦 一鍵下載 {len(available_files)} 張去背圖片 (ZIP 壓縮檔)",
             data=zip_buffer.getvalue(),
             file_name="pet_images_output.zip",
             mime="application/zip",
